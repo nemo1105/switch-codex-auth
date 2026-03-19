@@ -24,11 +24,13 @@ type candidate struct {
 func main() {
 	listOnly := flag.Bool("list", false, "show the current auth and all available auth.json.* files")
 	useValue := flag.String("use", "", "switch to auth.json.<suffix> or the menu index")
+	saveValue := flag.String("save", "", "copy the current auth.json to auth.json.<suffix>")
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(), "Usage:\n")
 		fmt.Fprintf(flag.CommandLine.Output(), "  %s\n", filepath.Base(os.Args[0]))
 		fmt.Fprintf(flag.CommandLine.Output(), "  %s --list\n", filepath.Base(os.Args[0]))
 		fmt.Fprintf(flag.CommandLine.Output(), "  %s --use <suffix-or-index>\n", filepath.Base(os.Args[0]))
+		fmt.Fprintf(flag.CommandLine.Output(), "  %s --save <suffix>\n", filepath.Base(os.Args[0]))
 		fmt.Fprintf(flag.CommandLine.Output(), "\nEnvironment:\n")
 		fmt.Fprintf(flag.CommandLine.Output(), "  CODEX_HOME  Override the auth directory. Defaults to %s\n", defaultCodexHomeHint())
 	}
@@ -36,6 +38,20 @@ func main() {
 
 	if flag.NArg() != 0 {
 		exitf("unknown argument: %s", strings.Join(flag.Args(), " "))
+	}
+
+	actionCount := 0
+	if *listOnly {
+		actionCount++
+	}
+	if *useValue != "" {
+		actionCount++
+	}
+	if *saveValue != "" {
+		actionCount++
+	}
+	if actionCount > 1 {
+		exitf("use only one of --list, --use, or --save")
 	}
 
 	codexDir, err := codexHome()
@@ -58,6 +74,10 @@ func main() {
 		printStatus(codexDir, current, candidates)
 	case *useValue != "":
 		if err := switchTo(codexDir, current, candidates, *useValue); err != nil {
+			exitErr(err)
+		}
+	case *saveValue != "":
+		if err := saveCurrentAs(codexDir, *saveValue); err != nil {
 			exitErr(err)
 		}
 	default:
@@ -235,16 +255,62 @@ func normalizeSelection(selection string) string {
 	return selection
 }
 
-func replaceAuthFile(codexDir, sourcePath string) error {
+func saveCurrentAs(codexDir, selection string) error {
 	activePath := filepath.Join(codexDir, "auth.json")
+	if _, err := os.Stat(activePath); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("active auth file does not exist: %s", activePath)
+		}
+		return fmt.Errorf("stat %s: %w", activePath, err)
+	}
 
+	suffix, err := normalizeSuffix(selection)
+	if err != nil {
+		return err
+	}
+
+	targetPath := filepath.Join(codexDir, "auth.json."+suffix)
+	if _, err := os.Stat(targetPath); err == nil {
+		return fmt.Errorf("auth alias already exists: %s", filepath.Base(targetPath))
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("stat %s: %w", targetPath, err)
+	}
+
+	if err := copyFileToTarget(activePath, targetPath, false); err != nil {
+		return err
+	}
+
+	fmt.Printf("Saved current auth as: %s\n", suffix)
+	return nil
+}
+
+func normalizeSuffix(selection string) (string, error) {
+	suffix := normalizeSelection(selection)
+	if suffix == "" {
+		return "", fmt.Errorf("suffix cannot be empty")
+	}
+	if suffix == "." || suffix == ".." {
+		return "", fmt.Errorf("invalid suffix: %s", suffix)
+	}
+	if strings.Contains(suffix, "/") || strings.Contains(suffix, "\\") {
+		return "", fmt.Errorf("suffix cannot contain path separators: %s", suffix)
+	}
+	return suffix, nil
+}
+
+func replaceAuthFile(codexDir, sourcePath string) error {
+	return copyFileToTarget(sourcePath, filepath.Join(codexDir, "auth.json"), true)
+}
+
+func copyFileToTarget(sourcePath, targetPath string, overwrite bool) error {
 	source, err := os.Open(sourcePath)
 	if err != nil {
 		return fmt.Errorf("open %s: %w", sourcePath, err)
 	}
 	defer source.Close()
 
-	tmp, err := os.CreateTemp(codexDir, "auth.json.tmp.*")
+	tmpDir := filepath.Dir(targetPath)
+	tmp, err := os.CreateTemp(tmpDir, "auth.json.tmp.*")
 	if err != nil {
 		return fmt.Errorf("create temp auth file: %w", err)
 	}
@@ -271,12 +337,15 @@ func replaceAuthFile(codexDir, sourcePath string) error {
 		return fmt.Errorf("close temp auth file: %w", err)
 	}
 
-	if err := os.Rename(tmpPath, activePath); err != nil {
-		if removeErr := os.Remove(activePath); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
-			return fmt.Errorf("replace %s: rename failed (%v), remove failed (%w)", activePath, err, removeErr)
+	if err := os.Rename(tmpPath, targetPath); err != nil {
+		if !overwrite {
+			return fmt.Errorf("move temp auth file to %s: %w", targetPath, err)
 		}
-		if renameErr := os.Rename(tmpPath, activePath); renameErr != nil {
-			return fmt.Errorf("replace %s after remove: %w", activePath, renameErr)
+		if removeErr := os.Remove(targetPath); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			return fmt.Errorf("replace %s: rename failed (%v), remove failed (%w)", targetPath, err, removeErr)
+		}
+		if renameErr := os.Rename(tmpPath, targetPath); renameErr != nil {
+			return fmt.Errorf("replace %s after remove: %w", targetPath, renameErr)
 		}
 	}
 

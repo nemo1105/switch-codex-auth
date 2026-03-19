@@ -38,6 +38,13 @@ switch-codex-auth --use 11
 switch-codex-auth --use auth.json.wcl
 ```
 
+Save the current `auth.json` as a new alias:
+
+```bash
+switch-codex-auth --save demo
+switch-codex-auth --save auth.json.backup-20260319
+```
+
 ## Auth Directory
 
 By default the tool reads auth files from:
@@ -52,4 +59,5 @@ You can override the directory with `CODEX_HOME`.
 - Scans `auth.json.*` files and lists them by suffix.
 - Detects which backup currently matches `auth.json`.
 - Replaces `auth.json` through a temp file in the same directory before renaming it into place.
+- Saves a new alias with `--save <suffix>` without overwriting an existing `auth.json.<suffix>`.
 - Supports number selection or suffix selection in interactive mode.
