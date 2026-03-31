@@ -11,15 +11,16 @@ import (
 )
 
 func TestPrintStatus(t *testing.T) {
-	oldLocal := time.Local
-	time.Local = time.FixedZone("CST", 8*60*60)
+	fixedNow := time.Date(2026, 3, 31, 10, 0, 0, 0, time.UTC)
+	oldNow := nowFunc
+	nowFunc = func() time.Time { return fixedNow }
 	t.Cleanup(func() {
-		time.Local = oldLocal
+		nowFunc = oldNow
 	})
 
-	baseMod := time.Date(2026, 3, 31, 9, 24, 14, 0, time.UTC)
-	baseAccess := time.Date(2026, 3, 31, 9, 57, 23, 0, time.UTC)
-	baseRefresh := time.Date(2026, 3, 31, 9, 23, 25, 0, time.UTC)
+	baseMod := fixedNow.Add(-36 * time.Minute)
+	baseAccess := fixedNow.Add(-3 * time.Minute)
+	baseRefresh := fixedNow.Add(-37 * time.Minute)
 
 	tests := []struct {
 		name            string
@@ -57,9 +58,9 @@ func TestPrintStatus(t *testing.T) {
 				"Current",
 				"Accessed",
 				"Last refresh",
-				"2026-03-31 17:24:14 +0800",
-				"2026-03-31 17:57:23 +0800",
-				"2026-03-31 17:23:25 +0800",
+				"36m ago",
+				"3m ago",
+				"37m ago",
 				"Hint: newer last_refresh and access times usually mean more recent activity",
 			},
 			wantMissing: []string{
@@ -80,7 +81,7 @@ func TestPrintStatus(t *testing.T) {
 				{Suffix: "09"},
 			},
 			wantContains: []string{
-				"Current auth details: mtime=2026-03-31 17:24:14 +0800, atime=2026-03-31 17:57:23 +0800, last_refresh=2026-03-31 17:23:25 +0800",
+				"Current auth details: mtime=36m ago, atime=3m ago, last_refresh=37m ago",
 			},
 		},
 		{
@@ -178,7 +179,22 @@ func TestLoadAuthMetadataIgnoresInvalidLastRefreshAndKeepsCapturedTimes(t *testi
 }
 
 func TestFormatDisplayTimeFallback(t *testing.T) {
+	fixedNow := time.Date(2026, 3, 31, 10, 0, 0, 0, time.UTC)
+	oldNow := nowFunc
+	nowFunc = func() time.Time { return fixedNow }
+	t.Cleanup(func() {
+		nowFunc = oldNow
+	})
+
 	if got := formatDisplayTime(time.Time{}, false); got != "-" {
 		t.Fatalf("unexpected fallback format: %q", got)
+	}
+
+	if got := formatDisplayTime(fixedNow.Add(-3*time.Hour), true); got != "3h ago" {
+		t.Fatalf("unexpected past format: %q", got)
+	}
+
+	if got := formatDisplayTime(fixedNow.Add(3*24*time.Hour), true); got != "in 3d" {
+		t.Fatalf("unexpected future format: %q", got)
 	}
 }

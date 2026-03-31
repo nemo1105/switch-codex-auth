@@ -32,6 +32,8 @@ type authMetadata struct {
 	HasLastRefresh bool
 }
 
+var nowFunc = time.Now
+
 func main() {
 	listOnly := flag.Bool("list", false, "show the current auth and all available auth.json.* files")
 	useValue := flag.String("use", "", "switch to auth.json.<suffix> or the menu index")
@@ -267,24 +269,22 @@ func printStatus(w io.Writer, codexDir, current string, currentMetadata *authMet
 		return
 	}
 
-	suffixWidth := len("Suffix")
-	for _, candidate := range candidates {
-		if len(candidate.Suffix) > suffixWidth {
-			suffixWidth = len(candidate.Suffix)
-		}
+	type candidateRow struct {
+		index       string
+		current     string
+		suffix      string
+		modified    string
+		accessed    string
+		lastRefresh string
 	}
 
-	fmt.Fprintf(
-		w,
-		"  %-3s %-7s %-*s %-25s %-25s %-25s\n",
-		"#",
-		"Current",
-		suffixWidth,
-		"Suffix",
-		"Modified",
-		"Accessed",
-		"Last refresh",
-	)
+	rows := make([]candidateRow, 0, len(candidates))
+	indexWidth := len("#")
+	currentWidth := len("Current")
+	suffixWidth := len("Suffix")
+	modifiedWidth := len("Modified")
+	accessedWidth := len("Accessed")
+	lastRefreshWidth := len("Last refresh")
 
 	for i, candidate := range candidates {
 		marker := ""
@@ -292,16 +292,66 @@ func printStatus(w io.Writer, codexDir, current string, currentMetadata *authMet
 			marker = "*"
 		}
 
+		row := candidateRow{
+			index:       strconv.Itoa(i + 1),
+			current:     marker,
+			suffix:      candidate.Suffix,
+			modified:    formatDisplayTime(candidate.Metadata.ModTime, true),
+			accessed:    formatDisplayTime(candidate.Metadata.AccessTime, candidate.Metadata.HasAccessTime),
+			lastRefresh: formatDisplayTime(candidate.Metadata.LastRefresh, candidate.Metadata.HasLastRefresh),
+		}
+		rows = append(rows, row)
+
+		if len(row.index) > indexWidth {
+			indexWidth = len(row.index)
+		}
+		if len(row.suffix) > suffixWidth {
+			suffixWidth = len(row.suffix)
+		}
+		if len(row.modified) > modifiedWidth {
+			modifiedWidth = len(row.modified)
+		}
+		if len(row.accessed) > accessedWidth {
+			accessedWidth = len(row.accessed)
+		}
+		if len(row.lastRefresh) > lastRefreshWidth {
+			lastRefreshWidth = len(row.lastRefresh)
+		}
+	}
+
+	fmt.Fprintf(
+		w,
+		"  %-*s %-*s %-*s %-*s %-*s %-*s\n",
+		indexWidth,
+		"#",
+		currentWidth,
+		"Current",
+		suffixWidth,
+		"Suffix",
+		modifiedWidth,
+		"Modified",
+		accessedWidth,
+		"Accessed",
+		lastRefreshWidth,
+		"Last refresh",
+	)
+
+	for _, row := range rows {
 		fmt.Fprintf(
 			w,
-			"  %-3d %-7s %-*s %-25s %-25s %-25s\n",
-			i+1,
-			marker,
+			"  %-*s %-*s %-*s %-*s %-*s %-*s\n",
+			indexWidth,
+			row.index,
+			currentWidth,
+			row.current,
 			suffixWidth,
-			candidate.Suffix,
-			formatDisplayTime(candidate.Metadata.ModTime, true),
-			formatDisplayTime(candidate.Metadata.AccessTime, candidate.Metadata.HasAccessTime),
-			formatDisplayTime(candidate.Metadata.LastRefresh, candidate.Metadata.HasLastRefresh),
+			row.suffix,
+			modifiedWidth,
+			row.modified,
+			accessedWidth,
+			row.accessed,
+			lastRefreshWidth,
+			row.lastRefresh,
 		)
 	}
 
@@ -312,7 +362,32 @@ func formatDisplayTime(value time.Time, ok bool) string {
 	if !ok {
 		return "-"
 	}
-	return value.Local().Format("2006-01-02 15:04:05 -0700")
+	return formatRelativeTime(value, nowFunc())
+}
+
+func formatRelativeTime(value, now time.Time) string {
+	delta := now.Sub(value)
+	if delta < 0 {
+		return "in " + formatRelativeAmount(-delta)
+	}
+	return formatRelativeAmount(delta) + " ago"
+}
+
+func formatRelativeAmount(delta time.Duration) string {
+	switch {
+	case delta < time.Minute:
+		return "<1m"
+	case delta < time.Hour:
+		return fmt.Sprintf("%dm", int(delta/time.Minute))
+	case delta < 24*time.Hour:
+		return fmt.Sprintf("%dh", int(delta/time.Hour))
+	case delta < 30*24*time.Hour:
+		return fmt.Sprintf("%dd", int(delta/(24*time.Hour)))
+	case delta < 365*24*time.Hour:
+		return fmt.Sprintf("%dmo", int(delta/(30*24*time.Hour)))
+	default:
+		return fmt.Sprintf("%dy", int(delta/(365*24*time.Hour)))
+	}
 }
 
 func interactiveMode(codexDir, current string, currentMetadata *authMetadata, candidates []candidate) error {
