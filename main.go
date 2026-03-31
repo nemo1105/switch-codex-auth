@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -13,12 +14,22 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type candidate struct {
-	Name   string
-	Suffix string
-	Path   string
+	Name     string
+	Suffix   string
+	Path     string
+	Metadata authMetadata
+}
+
+type authMetadata struct {
+	ModTime        time.Time
+	AccessTime     time.Time
+	HasAccessTime  bool
+	LastRefresh    time.Time
+	HasLastRefresh bool
 }
 
 func main() {
@@ -64,6 +75,11 @@ func main() {
 		exitErr(err)
 	}
 
+	currentMetadata, err := loadCurrentAuthMetadata(codexDir)
+	if err != nil {
+		exitErr(err)
+	}
+
 	current, err := currentSuffix(codexDir, candidates)
 	if err != nil {
 		exitErr(err)
@@ -71,7 +87,7 @@ func main() {
 
 	switch {
 	case *listOnly:
-		printStatus(codexDir, current, candidates)
+		printStatus(os.Stdout, codexDir, current, currentMetadata, candidates)
 	case *useValue != "":
 		if err := switchTo(codexDir, current, candidates, *useValue); err != nil {
 			exitErr(err)
@@ -81,7 +97,7 @@ func main() {
 			exitErr(err)
 		}
 	default:
-		if err := interactiveMode(codexDir, current, candidates); err != nil {
+		if err := interactiveMode(codexDir, current, currentMetadata, candidates); err != nil {
 			exitErr(err)
 		}
 	}
@@ -134,11 +150,78 @@ func loadCandidates(codexDir string) ([]candidate, error) {
 		})
 	}
 
+	for i := range candidates {
+		info, err := os.Stat(candidates[i].Path)
+		if err != nil {
+			return nil, fmt.Errorf("stat %s: %w", candidates[i].Path, err)
+		}
+
+		candidates[i].Metadata = loadAuthMetadata(candidates[i].Path, info)
+	}
+
 	sort.Slice(candidates, func(i, j int) bool {
 		return candidates[i].Suffix < candidates[j].Suffix
 	})
 
 	return candidates, nil
+}
+
+func loadCurrentAuthMetadata(codexDir string) (*authMetadata, error) {
+	activePath := filepath.Join(codexDir, "auth.json")
+	info, err := os.Stat(activePath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("stat %s: %w", activePath, err)
+	}
+
+	metadata := loadAuthMetadata(activePath, info)
+	return &metadata, nil
+}
+
+func loadAuthMetadata(path string, info os.FileInfo) authMetadata {
+	metadata := authMetadata{
+		ModTime: info.ModTime(),
+	}
+
+	if accessTime, ok := fileAccessTime(info); ok {
+		metadata.AccessTime = accessTime
+		metadata.HasAccessTime = true
+	}
+
+	if lastRefresh, ok := readLastRefresh(path); ok {
+		metadata.LastRefresh = lastRefresh
+		metadata.HasLastRefresh = true
+	}
+
+	return metadata
+}
+
+func readLastRefresh(path string) (time.Time, bool) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return time.Time{}, false
+	}
+
+	var payload struct {
+		LastRefresh string `json:"last_refresh"`
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return time.Time{}, false
+	}
+
+	value := strings.TrimSpace(payload.LastRefresh)
+	if value == "" {
+		return time.Time{}, false
+	}
+
+	parsed, err := time.Parse(time.RFC3339Nano, value)
+	if err != nil {
+		return time.Time{}, false
+	}
+
+	return parsed, true
 }
 
 func currentSuffix(codexDir string, candidates []candidate) (string, error) {
@@ -164,27 +247,76 @@ func currentSuffix(codexDir string, candidates []candidate) (string, error) {
 	return "custom/unmatched", nil
 }
 
-func printStatus(codexDir, current string, candidates []candidate) {
-	fmt.Printf("Auth dir: %s\n", codexDir)
-	fmt.Printf("Current auth: %s\n", current)
+func printStatus(w io.Writer, codexDir, current string, currentMetadata *authMetadata, candidates []candidate) {
+	fmt.Fprintf(w, "Auth dir: %s\n", codexDir)
+	fmt.Fprintf(w, "Current auth: %s\n", current)
 
+	if current == "custom/unmatched" && currentMetadata != nil {
+		fmt.Fprintf(
+			w,
+			"Current auth details: mtime=%s, atime=%s, last_refresh=%s\n",
+			formatDisplayTime(currentMetadata.ModTime, true),
+			formatDisplayTime(currentMetadata.AccessTime, currentMetadata.HasAccessTime),
+			formatDisplayTime(currentMetadata.LastRefresh, currentMetadata.HasLastRefresh),
+		)
+	}
+
+	fmt.Fprintf(w, "Available auth files (%d):\n", len(candidates))
 	if len(candidates) == 0 {
-		fmt.Println("Available auth files: none")
+		fmt.Fprintln(w, "  none")
 		return
 	}
 
-	fmt.Println("Available auth files:")
+	suffixWidth := len("Suffix")
+	for _, candidate := range candidates {
+		if len(candidate.Suffix) > suffixWidth {
+			suffixWidth = len(candidate.Suffix)
+		}
+	}
+
+	fmt.Fprintf(
+		w,
+		"  %-3s %-7s %-*s %-25s %-25s %-25s\n",
+		"#",
+		"Current",
+		suffixWidth,
+		"Suffix",
+		"Modified",
+		"Accessed",
+		"Last refresh",
+	)
+
 	for i, candidate := range candidates {
-		marker := " "
+		marker := ""
 		if candidate.Suffix == current {
 			marker = "*"
 		}
-		fmt.Printf("  [%d] %s %s\n", i+1, marker, candidate.Suffix)
+
+		fmt.Fprintf(
+			w,
+			"  %-3d %-7s %-*s %-25s %-25s %-25s\n",
+			i+1,
+			marker,
+			suffixWidth,
+			candidate.Suffix,
+			formatDisplayTime(candidate.Metadata.ModTime, true),
+			formatDisplayTime(candidate.Metadata.AccessTime, candidate.Metadata.HasAccessTime),
+			formatDisplayTime(candidate.Metadata.LastRefresh, candidate.Metadata.HasLastRefresh),
+		)
 	}
+
+	fmt.Fprintln(w, "Hint: newer last_refresh and access times usually mean more recent activity, but they do not guarantee remaining quota or validity.")
 }
 
-func interactiveMode(codexDir, current string, candidates []candidate) error {
-	printStatus(codexDir, current, candidates)
+func formatDisplayTime(value time.Time, ok bool) string {
+	if !ok {
+		return "-"
+	}
+	return value.Local().Format("2006-01-02 15:04:05 -0700")
+}
+
+func interactiveMode(codexDir, current string, currentMetadata *authMetadata, candidates []candidate) error {
+	printStatus(os.Stdout, codexDir, current, currentMetadata, candidates)
 
 	if len(candidates) == 0 {
 		return fmt.Errorf("no auth.json.* files found in %s", codexDir)

@@ -24,6 +24,10 @@ Show the current auth profile and available backups:
 switch-codex-auth --list
 ```
 
+The list shows how many `auth.json.*` backups are available, along with each file's
+modified time, access time (when supported by the filesystem), and `last_refresh`
+timestamp from the auth payload.
+
 Open the interactive selector:
 
 ```bash
@@ -57,6 +61,7 @@ You can override the directory with `CODEX_HOME`.
 ## Behavior
 
 - Scans `auth.json.*` files and lists them by suffix.
+- Shows the number of available auth files plus each backup's modified time, access time, and `last_refresh` when present.
 - Detects which backup currently matches `auth.json`.
 - Replaces `auth.json` through a temp file in the same directory before renaming it into place.
 - Saves a new alias with `--save <suffix>` without overwriting an existing `auth.json.<suffix>`.
