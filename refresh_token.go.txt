@@ -1,0 +1,673 @@
+package main
+
+import (
+	"bytes"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"time"
+)
+
+const (
+	defaultOriginator                              = "codex_cli_rs"
+	codexInternalOriginatorOverrideEnv             = "CODEX_INTERNAL_ORIGINATOR_OVERRIDE"
+	residencyHeaderName                            = "x-openai-internal-codex-residency"
+	defaultRefreshTokenURL                         = "https://auth.openai.com/oauth/token"
+	refreshTokenURLOverrideEnv                     = "CODEX_REFRESH_TOKEN_URL_OVERRIDE"
+	codexCACertificateEnv                          = "CODEX_CA_CERTIFICATE"
+	sslCertFileEnv                                 = "SSL_CERT_FILE"
+	clientID                                       = "app_EMoamEEZ73f0CkXaXp7hrann"
+	tokenRefreshIntervalDays                       = 8
+	refreshTokenExpiredMessage                     = "Your access token could not be refreshed because your refresh token has expired. Please log out and sign in again."
+	refreshTokenReusedMessage                      = "Your access token could not be refreshed because your refresh token was already used. Please log out and sign in again."
+	refreshTokenInvalidatedMessage                 = "Your access token could not be refreshed because your refresh token was revoked. Please log out and sign in again."
+	refreshTokenUnknownMessage                     = "Your access token could not be refreshed. Please log out and sign in again."
+	defaultComputedUserAgentVersion                = "0.0.0"
+	defaultRequestTimeout                          = 30 * time.Second
+	defaultAuthFilePermission          os.FileMode = 0o600
+)
+
+type authDotJSON struct {
+	AuthMode     *string    `json:"auth_mode,omitempty"`
+	OpenAIAPIKey *string    `json:"OPENAI_API_KEY"`
+	Tokens       *tokenData `json:"tokens,omitempty"`
+	LastRefresh  *time.Time `json:"last_refresh,omitempty"`
+}
+
+type tokenData struct {
+	IDToken      string  `json:"id_token"`
+	AccessToken  string  `json:"access_token"`
+	RefreshToken string  `json:"refresh_token"`
+	AccountID    *string `json:"account_id"`
+}
+
+type refreshRequest struct {
+	ClientID     string `json:"client_id"`
+	GrantType    string `json:"grant_type"`
+	RefreshToken string `json:"refresh_token"`
+}
+
+type refreshResponse struct {
+	IDToken      *string `json:"id_token"`
+	AccessToken  *string `json:"access_token"`
+	RefreshToken *string `json:"refresh_token"`
+}
+
+type config struct {
+	AuthFile        string
+	Originator      string
+	UserAgent       string
+	UserAgentSuffix string
+	CodexVersion    string
+	Residency       string
+	Timeout         time.Duration
+}
+
+type refreshTokenFailedReason string
+
+const (
+	refreshTokenFailedReasonExpired   refreshTokenFailedReason = "expired"
+	refreshTokenFailedReasonExhausted refreshTokenFailedReason = "exhausted"
+	refreshTokenFailedReasonRevoked   refreshTokenFailedReason = "revoked"
+	refreshTokenFailedReasonOther     refreshTokenFailedReason = "other"
+)
+
+type refreshTokenPermanentError struct {
+	Reason  refreshTokenFailedReason
+	Message string
+}
+
+func (e *refreshTokenPermanentError) Error() string {
+	return e.Message
+}
+
+func main() {
+	cfg := parseFlags()
+
+	if err := run(cfg); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+}
+
+func parseFlags() config {
+	authFile := flag.String("auth-file", "", "Path to auth.json. Defaults to $CODEX_HOME/auth.json or ~/.codex/auth.json.")
+	codexHome := flag.String("codex-home", "", "Codex home directory. Used only when -auth-file is not provided.")
+	originator := flag.String("originator", "", "Value for the originator header. Defaults to CODEX_INTERNAL_ORIGINATOR_OVERRIDE or codex_cli_rs.")
+	userAgent := flag.String("user-agent", "", "Full User-Agent header to send. If empty, compute a Codex-like User-Agent.")
+	userAgentSuffix := flag.String("user-agent-suffix", "", "Optional suffix appended as ` (suffix)` to the computed User-Agent.")
+	codexVersion := flag.String("codex-version", defaultComputedUserAgentVersion, "Version used when computing the Codex-like User-Agent.")
+	residency := flag.String("residency", "", "Optional residency value for x-openai-internal-codex-residency. Current Rust code only emits `us` when configured.")
+	timeout := flag.Duration("timeout", defaultRequestTimeout, "HTTP timeout for the refresh request.")
+	flag.Parse()
+
+	resolvedAuthFile := strings.TrimSpace(*authFile)
+	if resolvedAuthFile == "" {
+		resolvedAuthFile = filepath.Join(resolveCodexHome(strings.TrimSpace(*codexHome)), "auth.json")
+	}
+
+	return config{
+		AuthFile:        resolvedAuthFile,
+		Originator:      strings.TrimSpace(*originator),
+		UserAgent:       strings.TrimSpace(*userAgent),
+		UserAgentSuffix: strings.TrimSpace(*userAgentSuffix),
+		CodexVersion:    strings.TrimSpace(*codexVersion),
+		Residency:       strings.TrimSpace(*residency),
+		Timeout:         *timeout,
+	}
+}
+
+func run(cfg config) error {
+	auth, err := loadAuth(cfg.AuthFile)
+	if err != nil {
+		return fmt.Errorf("load auth file: %w", err)
+	}
+
+	if resolvedMode(auth) != "chatgpt" {
+		return fmt.Errorf("auth_mode must resolve to chatgpt, got %q", resolvedMode(auth))
+	}
+	if auth.Tokens == nil {
+		return errors.New("auth.json does not contain tokens")
+	}
+	if strings.TrimSpace(auth.Tokens.RefreshToken) == "" {
+		return errors.New("auth.json does not contain a refresh_token")
+	}
+
+	client, err := buildHTTPClient(cfg)
+	if err != nil {
+		return fmt.Errorf("build HTTP client: %w", err)
+	}
+
+	refreshResp, err := requestChatGPTTokenRefresh(client, cfg, auth.Tokens.RefreshToken)
+	if err != nil {
+		return err
+	}
+
+	latestAuth, err := loadAuth(cfg.AuthFile)
+	if err != nil {
+		return fmt.Errorf("reload auth file before persist: %w", err)
+	}
+	if resolvedMode(latestAuth) != "chatgpt" {
+		return fmt.Errorf("auth_mode changed during refresh and now resolves to %q", resolvedMode(latestAuth))
+	}
+	if latestAuth.Tokens == nil {
+		return errors.New("auth.json no longer contains tokens")
+	}
+
+	if refreshResp.IDToken != nil {
+		latestAuth.Tokens.IDToken = *refreshResp.IDToken
+	}
+	if refreshResp.AccessToken != nil {
+		latestAuth.Tokens.AccessToken = *refreshResp.AccessToken
+	}
+	if refreshResp.RefreshToken != nil {
+		latestAuth.Tokens.RefreshToken = *refreshResp.RefreshToken
+	}
+	now := time.Now().UTC()
+	latestAuth.LastRefresh = &now
+
+	if err := saveAuth(cfg.AuthFile, latestAuth); err != nil {
+		return fmt.Errorf("persist refreshed auth: %w", err)
+	}
+
+	expiresAt, _ := jwtExpiration(latestAuth.Tokens.AccessToken)
+	if expiresAt != nil {
+		fmt.Printf("refreshed %s\naccess token expires at %s\n", cfg.AuthFile, expiresAt.Format(time.RFC3339))
+		return nil
+	}
+
+	fmt.Printf("refreshed %s\nlast_refresh set to %s (proactive refresh threshold: %d days)\n",
+		cfg.AuthFile,
+		now.Format(time.RFC3339),
+		tokenRefreshIntervalDays,
+	)
+	return nil
+}
+
+func resolveCodexHome(explicit string) string {
+	if explicit != "" {
+		return explicit
+	}
+	if env := strings.TrimSpace(os.Getenv("CODEX_HOME")); env != "" {
+		return env
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ".codex"
+	}
+	return filepath.Join(home, ".codex")
+}
+
+func resolvedMode(auth authDotJSON) string {
+	if auth.AuthMode != nil && strings.TrimSpace(*auth.AuthMode) != "" {
+		return strings.TrimSpace(*auth.AuthMode)
+	}
+	if auth.OpenAIAPIKey != nil {
+		return "apikey"
+	}
+	return "chatgpt"
+}
+
+func loadAuth(path string) (authDotJSON, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return authDotJSON{}, err
+	}
+
+	var auth authDotJSON
+	if err := json.Unmarshal(data, &auth); err != nil {
+		return authDotJSON{}, err
+	}
+	return auth, nil
+}
+
+func saveAuth(path string, auth authDotJSON) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+
+	data, err := json.MarshalIndent(auth, "", "  ")
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+
+	tempFile, err := os.CreateTemp(filepath.Dir(path), ".auth.json.*.tmp")
+	if err != nil {
+		return err
+	}
+	tempName := tempFile.Name()
+	defer func() {
+		_ = os.Remove(tempName)
+	}()
+
+	if err := tempFile.Chmod(defaultAuthFilePermission); err != nil && !errors.Is(err, os.ErrPermission) {
+		_ = tempFile.Close()
+		return err
+	}
+	if _, err := tempFile.Write(data); err != nil {
+		_ = tempFile.Close()
+		return err
+	}
+	if err := tempFile.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tempName, path); err != nil {
+		return err
+	}
+	if err := os.Chmod(path, defaultAuthFilePermission); err != nil && !errors.Is(err, os.ErrPermission) {
+		return err
+	}
+	return nil
+}
+
+func buildHTTPClient(cfg config) (*http.Client, error) {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	if os.Getenv("CODEX_SANDBOX") == "seatbelt" {
+		transport.Proxy = nil
+	}
+
+	rootCAs, err := configuredCustomCAPool()
+	if err != nil {
+		return nil, err
+	}
+	if rootCAs != nil {
+		if transport.TLSClientConfig == nil {
+			transport.TLSClientConfig = &tls.Config{}
+		}
+		transport.TLSClientConfig.RootCAs = rootCAs
+	}
+
+	return &http.Client{
+		Timeout:   cfg.Timeout,
+		Transport: transport,
+	}, nil
+}
+
+func configuredCustomCAPool() (*x509.CertPool, error) {
+	path, sourceEnv := configuredCABundlePath()
+	if path == "" {
+		return nil, nil
+	}
+
+	pemData, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read CA certificate file %s selected by %s: %w", path, sourceEnv, err)
+	}
+
+	pool, err := x509.SystemCertPool()
+	if err != nil || pool == nil {
+		pool = x509.NewCertPool()
+	}
+	if ok := pool.AppendCertsFromPEM(pemData); !ok {
+		return nil, fmt.Errorf("failed to load CA certificates from %s selected by %s: no parseable CERTIFICATE blocks found", path, sourceEnv)
+	}
+	return pool, nil
+}
+
+func configuredCABundlePath() (path string, sourceEnv string) {
+	if value := strings.TrimSpace(os.Getenv(codexCACertificateEnv)); value != "" {
+		return value, codexCACertificateEnv
+	}
+	if value := strings.TrimSpace(os.Getenv(sslCertFileEnv)); value != "" {
+		return value, sslCertFileEnv
+	}
+	return "", ""
+}
+
+func requestChatGPTTokenRefresh(client *http.Client, cfg config, refreshToken string) (refreshResponse, error) {
+	payload := refreshRequest{
+		ClientID:     clientID,
+		GrantType:    "refresh_token",
+		RefreshToken: refreshToken,
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return refreshResponse{}, err
+	}
+
+	endpoint := refreshTokenEndpoint()
+	req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return refreshResponse{}, err
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("originator", resolveOriginator(cfg.Originator))
+	req.Header.Set("User-Agent", resolveUserAgent(cfg))
+	if residency := strings.TrimSpace(cfg.Residency); residency != "" {
+		req.Header.Set(residencyHeaderName, residency)
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return refreshResponse{}, err
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return refreshResponse{}, err
+	}
+
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		var parsed refreshResponse
+		if err := json.Unmarshal(respBody, &parsed); err != nil {
+			return refreshResponse{}, err
+		}
+		return parsed, nil
+	}
+
+	bodyText := string(respBody)
+	if resp.StatusCode == http.StatusUnauthorized {
+		return refreshResponse{}, classifyRefreshTokenFailure(bodyText)
+	}
+
+	return refreshResponse{}, fmt.Errorf(
+		"failed to refresh token: %s: %s",
+		resp.Status,
+		tryParseErrorMessage(bodyText),
+	)
+}
+
+func refreshTokenEndpoint() string {
+	if value := strings.TrimSpace(os.Getenv(refreshTokenURLOverrideEnv)); value != "" {
+		return value
+	}
+	return defaultRefreshTokenURL
+}
+
+func classifyRefreshTokenFailure(body string) error {
+	code := strings.ToLower(strings.TrimSpace(extractRefreshTokenErrorCode(body)))
+
+	reason := refreshTokenFailedReasonOther
+	message := refreshTokenUnknownMessage
+
+	switch code {
+	case "refresh_token_expired":
+		reason = refreshTokenFailedReasonExpired
+		message = refreshTokenExpiredMessage
+	case "refresh_token_reused":
+		reason = refreshTokenFailedReasonExhausted
+		message = refreshTokenReusedMessage
+	case "refresh_token_invalidated":
+		reason = refreshTokenFailedReasonRevoked
+		message = refreshTokenInvalidatedMessage
+	}
+
+	return &refreshTokenPermanentError{
+		Reason:  reason,
+		Message: message,
+	}
+}
+
+func extractRefreshTokenErrorCode(body string) string {
+	body = strings.TrimSpace(body)
+	if body == "" {
+		return ""
+	}
+
+	var payload any
+	if err := json.Unmarshal([]byte(body), &payload); err != nil {
+		return ""
+	}
+
+	root, ok := payload.(map[string]any)
+	if !ok {
+		return ""
+	}
+
+	if rawError, ok := root["error"]; ok {
+		switch value := rawError.(type) {
+		case map[string]any:
+			if code, ok := value["code"].(string); ok {
+				return code
+			}
+		case string:
+			return value
+		}
+	}
+
+	code, _ := root["code"].(string)
+	return code
+}
+
+func tryParseErrorMessage(text string) string {
+	if strings.TrimSpace(text) == "" {
+		return "Unknown error"
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(text), &payload); err != nil {
+		return text
+	}
+
+	if rawError, ok := payload["error"].(map[string]any); ok {
+		if message, ok := rawError["message"].(string); ok && message != "" {
+			return message
+		}
+	}
+
+	return text
+}
+
+func resolveOriginator(flagValue string) string {
+	value := strings.TrimSpace(os.Getenv(codexInternalOriginatorOverrideEnv))
+	if value == "" {
+		value = strings.TrimSpace(flagValue)
+	}
+	if value == "" {
+		value = defaultOriginator
+	}
+	if isValidHeaderValue(value) {
+		return value
+	}
+	return defaultOriginator
+}
+
+func resolveUserAgent(cfg config) string {
+	if explicit := strings.TrimSpace(cfg.UserAgent); explicit != "" {
+		if isValidHeaderValue(explicit) {
+			return explicit
+		}
+		return sanitizeUserAgent(explicit, defaultOriginator)
+	}
+
+	version := cfg.CodexVersion
+	if version == "" {
+		version = defaultComputedUserAgentVersion
+	}
+	originator := resolveOriginator(cfg.Originator)
+	osType, osVersion := detectOSInfo()
+	terminalToken := detectTerminalUserAgentToken()
+
+	prefix := fmt.Sprintf(
+		"%s/%s (%s %s; %s) %s",
+		originator,
+		version,
+		osType,
+		osVersion,
+		runtime.GOARCH,
+		terminalToken,
+	)
+	candidate := prefix
+	if suffix := strings.TrimSpace(cfg.UserAgentSuffix); suffix != "" {
+		candidate = fmt.Sprintf("%s (%s)", prefix, suffix)
+	}
+	return sanitizeUserAgent(candidate, prefix)
+}
+
+func sanitizeUserAgent(candidate string, fallback string) string {
+	if isValidHeaderValue(candidate) {
+		return candidate
+	}
+
+	var b strings.Builder
+	b.Grow(len(candidate))
+	for _, r := range candidate {
+		if r >= ' ' && r <= '~' {
+			b.WriteRune(r)
+		} else {
+			b.WriteByte('_')
+		}
+	}
+	sanitized := b.String()
+	if sanitized != "" && isValidHeaderValue(sanitized) {
+		return sanitized
+	}
+	if isValidHeaderValue(fallback) {
+		return fallback
+	}
+	return defaultOriginator
+}
+
+func isValidHeaderValue(value string) bool {
+	if value == "" {
+		return false
+	}
+	for i := 0; i < len(value); i++ {
+		ch := value[i]
+		if ch == '\r' || ch == '\n' || ch == 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func detectOSInfo() (osType string, osVersion string) {
+	switch runtime.GOOS {
+	case "darwin":
+		return "Macos", "unknown"
+	case "windows":
+		return "Windows", "unknown"
+	case "linux":
+		name, version := linuxOSRelease()
+		if name != "" {
+			return name, version
+		}
+		return "Linux", "unknown"
+	default:
+		return strings.Title(runtime.GOOS), "unknown"
+	}
+}
+
+func linuxOSRelease() (string, string) {
+	data, err := os.ReadFile("/etc/os-release")
+	if err != nil {
+		return "", ""
+	}
+
+	values := make(map[string]string)
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		key, value, found := strings.Cut(line, "=")
+		if !found {
+			continue
+		}
+		values[key] = strings.Trim(value, `"`)
+	}
+
+	name := values["NAME"]
+	if name == "" {
+		name = values["ID"]
+	}
+	version := values["VERSION_ID"]
+	if version == "" {
+		version = "unknown"
+	}
+	return name, version
+}
+
+func detectTerminalUserAgentToken() string {
+	termProgram := strings.TrimSpace(os.Getenv("TERM_PROGRAM"))
+	termProgramVersion := strings.TrimSpace(os.Getenv("TERM_PROGRAM_VERSION"))
+	term := strings.TrimSpace(os.Getenv("TERM"))
+
+	switch {
+	case termProgram != "" && termProgramVersion != "":
+		return sanitizeUserAgent(fmt.Sprintf("%s/%s", termProgram, termProgramVersion), "unknown")
+	case termProgram != "":
+		return sanitizeUserAgent(termProgram, "unknown")
+	case term != "":
+		return sanitizeUserAgent(term, "unknown")
+	default:
+		return "unknown"
+	}
+}
+
+func jwtExpiration(jwt string) (*time.Time, error) {
+	parts := strings.Split(jwt, ".")
+	if len(parts) != 3 || parts[1] == "" {
+		return nil, errors.New("invalid JWT format")
+	}
+
+	payload, err := decodeRawURLBase64(parts[1])
+	if err != nil {
+		return nil, err
+	}
+
+	var claims struct {
+		Exp *int64 `json:"exp"`
+	}
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		return nil, err
+	}
+	if claims.Exp == nil {
+		return nil, nil
+	}
+
+	t := time.Unix(*claims.Exp, 0).UTC()
+	return &t, nil
+}
+
+func decodeRawURLBase64(s string) ([]byte, error) {
+	switch len(s) % 4 {
+	case 2:
+		s += "=="
+	case 3:
+		s += "="
+	}
+	return bytesFromBase64URL(s)
+}
+
+func bytesFromBase64URL(s string) ([]byte, error) {
+	const table = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+	index := make(map[byte]int, len(table))
+	for i := 0; i < len(table); i++ {
+		index[table[i]] = i
+	}
+
+	dst := make([]byte, 0, len(s)*3/4)
+	var buf uint32
+	var bits uint
+	for i := 0; i < len(s); i++ {
+		ch := s[i]
+		if ch == '=' {
+			break
+		}
+		val, ok := index[ch]
+		if !ok {
+			return nil, fmt.Errorf("invalid base64url character %q", ch)
+		}
+		buf = (buf << 6) | uint32(val)
+		bits += 6
+		if bits >= 8 {
+			bits -= 8
+			dst = append(dst, byte(buf>>bits))
+			buf &= (1 << bits) - 1
+		}
+	}
+	return dst, nil
+}

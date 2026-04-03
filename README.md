@@ -54,6 +54,15 @@ If the alias already exists, interactive terminals prompt you to press `Enter` t
 or type a different alias to save under. In non-interactive environments, use `--force`
 to overwrite an existing alias.
 
+Refresh every refreshable `auth.json.*` alias:
+
+```bash
+switch-codex-auth --refresh
+```
+
+`--refresh` only updates alias files, never the active `auth.json`. It skips aliases that
+are not refreshable and prints a summary of refreshed, skipped, and failed files.
+
 ## Auth Directory
 
 By default the tool reads auth files from:
@@ -71,4 +80,5 @@ You can override the directory with `CODEX_HOME`.
 - Replaces `auth.json` through a temp file in the same directory before renaming it into place.
 - Saves a new alias with `--save <suffix>`, prompting before overwriting an existing `auth.json.<suffix>` in interactive terminals.
 - Supports `-f` / `--force` with `--save` to overwrite an existing alias without prompting.
+- Refreshes all refreshable `auth.json.*` aliases with `--refresh`, grouping identical `refresh_token` values so the same token is refreshed only once.
 - Supports number selection or suffix selection in interactive mode.

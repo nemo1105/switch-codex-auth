@@ -38,6 +38,7 @@ func main() {
 	listOnly := flag.Bool("list", false, "show the current auth and all available auth.json.* files")
 	useValue := flag.String("use", "", "switch to auth.json.<suffix> or the menu index")
 	saveValue := flag.String("save", "", "copy the current auth.json to auth.json.<suffix>")
+	refreshValue := flag.Bool("refresh", false, "refresh all refreshable auth.json.* files")
 	var force bool
 	flag.BoolVar(&force, "f", false, "overwrite an existing auth alias when used with --save")
 	flag.BoolVar(&force, "force", false, "overwrite an existing auth alias when used with --save")
@@ -47,6 +48,7 @@ func main() {
 		fmt.Fprintf(flag.CommandLine.Output(), "  %s --list\n", filepath.Base(os.Args[0]))
 		fmt.Fprintf(flag.CommandLine.Output(), "  %s --use <suffix-or-index>\n", filepath.Base(os.Args[0]))
 		fmt.Fprintf(flag.CommandLine.Output(), "  %s --save <suffix> [-f|--force]\n", filepath.Base(os.Args[0]))
+		fmt.Fprintf(flag.CommandLine.Output(), "  %s --refresh\n", filepath.Base(os.Args[0]))
 		fmt.Fprintf(flag.CommandLine.Output(), "\nFlags:\n")
 		fmt.Fprintf(flag.CommandLine.Output(), "  -f, --force  overwrite an existing auth alias when used with --save\n")
 		fmt.Fprintf(flag.CommandLine.Output(), "\nEnvironment:\n")
@@ -58,18 +60,9 @@ func main() {
 		exitf("unknown argument: %s", strings.Join(flag.Args(), " "))
 	}
 
-	actionCount := 0
-	if *listOnly {
-		actionCount++
-	}
-	if *useValue != "" {
-		actionCount++
-	}
-	if *saveValue != "" {
-		actionCount++
-	}
-	if actionCount > 1 {
-		exitf("use only one of --list, --use, or --save")
+	actionCount, err := countSelectedActions(*listOnly, *useValue, *saveValue, *refreshValue)
+	if err != nil {
+		exitErr(err)
 	}
 	if err := validateSaveOptions(*saveValue, force); err != nil {
 		exitErr(err)
@@ -80,25 +73,33 @@ func main() {
 		exitErr(err)
 	}
 
-	candidates, err := loadCandidates(codexDir)
-	if err != nil {
-		exitErr(err)
-	}
-
-	currentMetadata, err := loadCurrentAuthMetadata(codexDir)
-	if err != nil {
-		exitErr(err)
-	}
-
-	current, err := currentSuffix(codexDir, candidates)
-	if err != nil {
-		exitErr(err)
+	var candidates []candidate
+	if *listOnly || *useValue != "" || *refreshValue || actionCount == 0 {
+		candidates, err = loadCandidates(codexDir)
+		if err != nil {
+			exitErr(err)
+		}
 	}
 
 	switch {
 	case *listOnly:
+		currentMetadata, err := loadCurrentAuthMetadata(codexDir)
+		if err != nil {
+			exitErr(err)
+		}
+
+		current, err := currentSuffix(codexDir, candidates)
+		if err != nil {
+			exitErr(err)
+		}
+
 		printStatus(os.Stdout, codexDir, current, currentMetadata, candidates)
 	case *useValue != "":
+		current, err := currentSuffix(codexDir, candidates)
+		if err != nil {
+			exitErr(err)
+		}
+
 		if err := switchTo(codexDir, current, candidates, *useValue); err != nil {
 			exitErr(err)
 		}
@@ -106,7 +107,21 @@ func main() {
 		if err := saveCurrentAs(codexDir, *saveValue, force); err != nil {
 			exitErr(err)
 		}
+	case *refreshValue:
+		if err := refreshAuthAliases(os.Stdout, codexDir, candidates); err != nil {
+			exitErr(err)
+		}
 	default:
+		currentMetadata, err := loadCurrentAuthMetadata(codexDir)
+		if err != nil {
+			exitErr(err)
+		}
+
+		current, err := currentSuffix(codexDir, candidates)
+		if err != nil {
+			exitErr(err)
+		}
+
 		if err := interactiveMode(codexDir, current, currentMetadata, candidates); err != nil {
 			exitErr(err)
 		}
@@ -475,6 +490,26 @@ func validateSaveOptions(saveValue string, force bool) error {
 		return fmt.Errorf("use --force only with --save")
 	}
 	return nil
+}
+
+func countSelectedActions(listOnly bool, useValue, saveValue string, refresh bool) (int, error) {
+	actionCount := 0
+	if listOnly {
+		actionCount++
+	}
+	if useValue != "" {
+		actionCount++
+	}
+	if saveValue != "" {
+		actionCount++
+	}
+	if refresh {
+		actionCount++
+	}
+	if actionCount > 1 {
+		return 0, fmt.Errorf("use only one of --list, --use, --save, or --refresh")
+	}
+	return actionCount, nil
 }
 
 func saveCurrentAs(codexDir, selection string, force bool) error {
