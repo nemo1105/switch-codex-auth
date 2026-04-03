@@ -370,47 +370,6 @@ func TestSaveCurrentAsWithIOEOFDoesNotOverwrite(t *testing.T) {
 	}
 }
 
-func TestValidateSaveOptions(t *testing.T) {
-	tests := []struct {
-		name      string
-		saveValue string
-		force     bool
-		wantErr   string
-	}{
-		{
-			name:      "force with save is allowed",
-			saveValue: "demo",
-			force:     true,
-		},
-		{
-			name: "no force is allowed",
-		},
-		{
-			name:    "force requires save",
-			force:   true,
-			wantErr: "use --force only with --save",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			err := validateSaveOptions(tt.saveValue, tt.force)
-			if tt.wantErr == "" {
-				if err != nil {
-					t.Fatalf("validateSaveOptions: %v", err)
-				}
-				return
-			}
-			if err == nil {
-				t.Fatalf("expected error %q", tt.wantErr)
-			}
-			if !strings.Contains(err.Error(), tt.wantErr) {
-				t.Fatalf("unexpected error: %v", err)
-			}
-		})
-	}
-}
-
 func writeAuthFile(t *testing.T, path, content string) {
 	t.Helper()
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {

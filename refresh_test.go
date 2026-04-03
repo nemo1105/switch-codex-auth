@@ -14,55 +14,6 @@ import (
 	"time"
 )
 
-func TestCountSelectedActions(t *testing.T) {
-	tests := []struct {
-		name      string
-		listOnly  bool
-		useValue  string
-		saveValue string
-		refresh   bool
-		wantCount int
-		wantErr   string
-	}{
-		{
-			name:      "refresh only",
-			refresh:   true,
-			wantCount: 1,
-		},
-		{
-			name:      "interactive default",
-			wantCount: 0,
-		},
-		{
-			name:     "mutually exclusive error",
-			listOnly: true,
-			refresh:  true,
-			wantErr:  "use only one of --list, --use, --save, or --refresh",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			count, err := countSelectedActions(tt.listOnly, tt.useValue, tt.saveValue, tt.refresh)
-			if tt.wantErr == "" {
-				if err != nil {
-					t.Fatalf("countSelectedActions: %v", err)
-				}
-				if count != tt.wantCount {
-					t.Fatalf("unexpected count: got %d want %d", count, tt.wantCount)
-				}
-				return
-			}
-			if err == nil {
-				t.Fatalf("expected error %q", tt.wantErr)
-			}
-			if !strings.Contains(err.Error(), tt.wantErr) {
-				t.Fatalf("unexpected error: %v", err)
-			}
-		})
-	}
-}
-
 func TestRefreshAuthAliasesRefreshesGroupsSkipsFailuresAndLeavesActiveAuthUnchanged(t *testing.T) {
 	dir := t.TempDir()
 

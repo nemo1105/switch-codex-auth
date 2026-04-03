@@ -35,97 +35,351 @@ type authMetadata struct {
 var nowFunc = time.Now
 
 func main() {
-	listOnly := flag.Bool("list", false, "show the current auth and all available auth.json.* files")
-	useValue := flag.String("use", "", "switch to auth.json.<suffix> or the menu index")
-	saveValue := flag.String("save", "", "copy the current auth.json to auth.json.<suffix>")
-	refreshValue := flag.Bool("refresh", false, "refresh all refreshable auth.json.* files")
-	var force bool
-	flag.BoolVar(&force, "f", false, "overwrite an existing auth alias when used with --save")
-	flag.BoolVar(&force, "force", false, "overwrite an existing auth alias when used with --save")
-	flag.Usage = func() {
-		fmt.Fprintf(flag.CommandLine.Output(), "Usage:\n")
-		fmt.Fprintf(flag.CommandLine.Output(), "  %s\n", filepath.Base(os.Args[0]))
-		fmt.Fprintf(flag.CommandLine.Output(), "  %s --list\n", filepath.Base(os.Args[0]))
-		fmt.Fprintf(flag.CommandLine.Output(), "  %s --use <suffix-or-index>\n", filepath.Base(os.Args[0]))
-		fmt.Fprintf(flag.CommandLine.Output(), "  %s --save <suffix> [-f|--force]\n", filepath.Base(os.Args[0]))
-		fmt.Fprintf(flag.CommandLine.Output(), "  %s --refresh\n", filepath.Base(os.Args[0]))
-		fmt.Fprintf(flag.CommandLine.Output(), "\nFlags:\n")
-		fmt.Fprintf(flag.CommandLine.Output(), "  -f, --force  overwrite an existing auth alias when used with --save\n")
-		fmt.Fprintf(flag.CommandLine.Output(), "\nEnvironment:\n")
-		fmt.Fprintf(flag.CommandLine.Output(), "  CODEX_HOME  Override the auth directory. Defaults to %s\n", defaultCodexHomeHint())
-	}
-	flag.Parse()
-
-	if flag.NArg() != 0 {
-		exitf("unknown argument: %s", strings.Join(flag.Args(), " "))
-	}
-
-	actionCount, err := countSelectedActions(*listOnly, *useValue, *saveValue, *refreshValue)
-	if err != nil {
+	if err := runCLI(os.Args[1:], os.Stdin, os.Stdout); err != nil {
 		exitErr(err)
 	}
-	if err := validateSaveOptions(*saveValue, force); err != nil {
-		exitErr(err)
+}
+
+func runCLI(args []string, in io.Reader, out io.Writer) error {
+	prog := filepath.Base(os.Args[0])
+	if len(args) == 0 {
+		return runInteractiveCommand(in, out)
 	}
 
-	codexDir, err := codexHome()
-	if err != nil {
-		exitErr(err)
+	switch args[0] {
+	case "-h", "--help":
+		writeRootUsage(out, prog)
+		return nil
+	case "help":
+		return runHelpCommand(args[1:], out, prog)
+	case "list":
+		return runListSubcommand(args[1:], out, prog)
+	case "use":
+		return runUseSubcommand(args[1:], out, prog)
+	case "save":
+		return runSaveSubcommand(args[1:], in, out, prog)
+	case "refresh":
+		return runRefreshSubcommand(args[1:], out, prog)
+	default:
+		if err := legacyActionFlagError(args, prog); err != nil {
+			return err
+		}
+
+		return fmt.Errorf("unknown command: %s (run `%s help` for usage)", args[0], prog)
 	}
+}
 
-	var candidates []candidate
-	if *listOnly || *useValue != "" || *refreshValue || actionCount == 0 {
-		candidates, err = loadCandidates(codexDir)
-		if err != nil {
-			exitErr(err)
-		}
-	}
-
-	switch {
-	case *listOnly:
-		currentMetadata, err := loadCurrentAuthMetadata(codexDir)
-		if err != nil {
-			exitErr(err)
-		}
-
-		current, err := currentSuffix(codexDir, candidates)
-		if err != nil {
-			exitErr(err)
-		}
-
-		printStatus(os.Stdout, codexDir, current, currentMetadata, candidates)
-	case *useValue != "":
-		current, err := currentSuffix(codexDir, candidates)
-		if err != nil {
-			exitErr(err)
-		}
-
-		if err := switchTo(codexDir, current, candidates, *useValue); err != nil {
-			exitErr(err)
-		}
-	case *saveValue != "":
-		if err := saveCurrentAs(codexDir, *saveValue, force); err != nil {
-			exitErr(err)
-		}
-	case *refreshValue:
-		if err := refreshAuthAliases(os.Stdout, codexDir, candidates); err != nil {
-			exitErr(err)
+func runHelpCommand(args []string, out io.Writer, prog string) error {
+	switch len(args) {
+	case 0:
+		writeRootUsage(out, prog)
+		return nil
+	case 1:
+		switch args[0] {
+		case "list":
+			writeListUsage(out, prog)
+			return nil
+		case "use":
+			writeUseUsage(out, prog)
+			return nil
+		case "save":
+			writeSaveUsage(out, prog)
+			return nil
+		case "refresh":
+			writeRefreshUsage(out, prog)
+			return nil
+		default:
+			return fmt.Errorf("unknown help topic: %s (run `%s help` for usage)", args[0], prog)
 		}
 	default:
-		currentMetadata, err := loadCurrentAuthMetadata(codexDir)
-		if err != nil {
-			exitErr(err)
-		}
+		return fmt.Errorf("help accepts at most one command (usage: %s help [command])", prog)
+	}
+}
 
-		current, err := currentSuffix(codexDir, candidates)
-		if err != nil {
-			exitErr(err)
-		}
+func runListSubcommand(args []string, out io.Writer, prog string) error {
+	handled, err := parseNoArgSubcommand("list", args, out, prog, writeListUsage)
+	if handled || err != nil {
+		return err
+	}
 
-		if err := interactiveMode(codexDir, current, currentMetadata, candidates); err != nil {
-			exitErr(err)
+	return runListCommand(out)
+}
+
+func runUseSubcommand(args []string, out io.Writer, prog string) error {
+	selection, handled, err := parseUseSubcommandArgs(args, out, prog)
+	if handled || err != nil {
+		return err
+	}
+
+	return runUseCommand(selection, out)
+}
+
+func runSaveSubcommand(args []string, in io.Reader, out io.Writer, prog string) error {
+	selection, force, handled, err := parseSaveSubcommandArgs(args, out, prog)
+	if handled || err != nil {
+		return err
+	}
+
+	return runSaveCommand(selection, force, in, out)
+}
+
+func runRefreshSubcommand(args []string, out io.Writer, prog string) error {
+	handled, err := parseNoArgSubcommand("refresh", args, out, prog, writeRefreshUsage)
+	if handled || err != nil {
+		return err
+	}
+
+	return runRefreshCommand(out)
+}
+
+func runInteractiveCommand(in io.Reader, out io.Writer) error {
+	codexDir, candidates, current, currentMetadata, err := loadInteractiveState()
+	if err != nil {
+		return err
+	}
+
+	return interactiveModeWithIO(codexDir, current, currentMetadata, candidates, in, out)
+}
+
+func runListCommand(out io.Writer) error {
+	codexDir, candidates, current, currentMetadata, err := loadInteractiveState()
+	if err != nil {
+		return err
+	}
+
+	printStatus(out, codexDir, current, currentMetadata, candidates)
+	return nil
+}
+
+func runUseCommand(selection string, out io.Writer) error {
+	codexDir, candidates, current, err := loadSwitchState()
+	if err != nil {
+		return err
+	}
+
+	return switchToWithIO(codexDir, current, candidates, out, selection)
+}
+
+func runSaveCommand(selection string, force bool, in io.Reader, out io.Writer) error {
+	codexDir, err := codexHome()
+	if err != nil {
+		return err
+	}
+
+	return saveCurrentAsWithIO(codexDir, selection, force, in, out, isInteractiveReader(in))
+}
+
+func runRefreshCommand(out io.Writer) error {
+	codexDir, err := codexHome()
+	if err != nil {
+		return err
+	}
+
+	candidates, err := loadCandidates(codexDir)
+	if err != nil {
+		return err
+	}
+
+	return refreshAuthAliases(out, codexDir, candidates)
+}
+
+func parseNoArgSubcommand(
+	name string,
+	args []string,
+	out io.Writer,
+	prog string,
+	usage func(io.Writer, string),
+) (bool, error) {
+	flagSet := flag.NewFlagSet(name, flag.ContinueOnError)
+	flagSet.SetOutput(io.Discard)
+
+	if err := flagSet.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			usage(out, prog)
+			return true, nil
+		}
+		return false, fmt.Errorf("%v (run `%s help %s` for usage)", err, prog, name)
+	}
+	if flagSet.NArg() != 0 {
+		return false, fmt.Errorf("%s does not accept arguments (usage: %s %s)", name, prog, name)
+	}
+
+	return false, nil
+}
+
+func parseUseSubcommandArgs(args []string, out io.Writer, prog string) (string, bool, error) {
+	flagSet := flag.NewFlagSet("use", flag.ContinueOnError)
+	flagSet.SetOutput(io.Discard)
+
+	if err := flagSet.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			writeUseUsage(out, prog)
+			return "", true, nil
+		}
+		return "", false, fmt.Errorf("%v (run `%s help use` for usage)", err, prog)
+	}
+
+	switch flagSet.NArg() {
+	case 1:
+		return flagSet.Arg(0), false, nil
+	case 0:
+		return "", false, fmt.Errorf("use requires <suffix-or-index> (usage: %s use <suffix-or-index>)", prog)
+	default:
+		return "", false, fmt.Errorf("use accepts exactly one <suffix-or-index> (usage: %s use <suffix-or-index>)", prog)
+	}
+}
+
+func parseSaveSubcommandArgs(args []string, out io.Writer, prog string) (string, bool, bool, error) {
+	flagSet := flag.NewFlagSet("save", flag.ContinueOnError)
+	flagSet.SetOutput(io.Discard)
+
+	var force bool
+	flagSet.BoolVar(&force, "f", false, "overwrite an existing auth alias")
+	flagSet.BoolVar(&force, "force", false, "overwrite an existing auth alias")
+
+	if err := flagSet.Parse(normalizeSaveArgs(args)); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			writeSaveUsage(out, prog)
+			return "", false, true, nil
+		}
+		return "", false, false, fmt.Errorf("%v (run `%s help save` for usage)", err, prog)
+	}
+
+	switch flagSet.NArg() {
+	case 1:
+		return flagSet.Arg(0), force, false, nil
+	case 0:
+		return "", false, false, fmt.Errorf("save requires <suffix> (usage: %s save <suffix> [-f|--force])", prog)
+	default:
+		return "", false, false, fmt.Errorf("save accepts exactly one <suffix> (usage: %s save <suffix> [-f|--force])", prog)
+	}
+}
+
+func normalizeSaveArgs(args []string) []string {
+	flags := make([]string, 0, len(args))
+	positionals := make([]string, 0, len(args))
+
+	for _, arg := range args {
+		switch arg {
+		case "-f", "--force", "-h", "--help":
+			flags = append(flags, arg)
+		default:
+			positionals = append(positionals, arg)
 		}
 	}
+
+	return append(flags, positionals...)
+}
+
+func legacyActionFlagError(args []string, prog string) error {
+	if len(args) == 0 {
+		return nil
+	}
+
+	var replacement []string
+	switch args[0] {
+	case "--list":
+		replacement = append([]string{"list"}, args[1:]...)
+	case "--use":
+		replacement = append([]string{"use"}, args[1:]...)
+	case "--save":
+		replacement = append([]string{"save"}, args[1:]...)
+	case "--refresh":
+		replacement = append([]string{"refresh"}, args[1:]...)
+	default:
+		return nil
+	}
+
+	return fmt.Errorf("legacy action flags are no longer supported: use `%s %s`", prog, strings.Join(replacement, " "))
+}
+
+func writeRootUsage(w io.Writer, prog string) {
+	fmt.Fprintf(w, "Usage:\n")
+	fmt.Fprintf(w, "  %s\n", prog)
+	fmt.Fprintf(w, "  %s list\n", prog)
+	fmt.Fprintf(w, "  %s use <suffix-or-index>\n", prog)
+	fmt.Fprintf(w, "  %s save <suffix> [-f|--force]\n", prog)
+	fmt.Fprintf(w, "  %s refresh\n", prog)
+	fmt.Fprintf(w, "  %s help [command]\n", prog)
+	fmt.Fprintf(w, "\nCommands:\n")
+	fmt.Fprintf(w, "  list     Show the current auth and all available auth.json.* files\n")
+	fmt.Fprintf(w, "  use      Switch to auth.json.<suffix> or a menu index\n")
+	fmt.Fprintf(w, "  save     Copy the current auth.json to auth.json.<suffix>\n")
+	fmt.Fprintf(w, "  refresh  Refresh all refreshable auth.json.* files\n")
+	fmt.Fprintf(w, "\nEnvironment:\n")
+	fmt.Fprintf(w, "  CODEX_HOME  Override the auth directory. Defaults to %s\n", defaultCodexHomeHint())
+}
+
+func writeListUsage(w io.Writer, prog string) {
+	fmt.Fprintf(w, "Usage:\n")
+	fmt.Fprintf(w, "  %s list\n", prog)
+}
+
+func writeUseUsage(w io.Writer, prog string) {
+	fmt.Fprintf(w, "Usage:\n")
+	fmt.Fprintf(w, "  %s use <suffix-or-index>\n", prog)
+}
+
+func writeSaveUsage(w io.Writer, prog string) {
+	fmt.Fprintf(w, "Usage:\n")
+	fmt.Fprintf(w, "  %s save <suffix> [-f|--force]\n", prog)
+}
+
+func writeRefreshUsage(w io.Writer, prog string) {
+	fmt.Fprintf(w, "Usage:\n")
+	fmt.Fprintf(w, "  %s refresh\n", prog)
+}
+
+func loadInteractiveState() (string, []candidate, string, *authMetadata, error) {
+	codexDir, err := codexHome()
+	if err != nil {
+		return "", nil, "", nil, err
+	}
+
+	candidates, err := loadCandidates(codexDir)
+	if err != nil {
+		return "", nil, "", nil, err
+	}
+
+	currentMetadata, err := loadCurrentAuthMetadata(codexDir)
+	if err != nil {
+		return "", nil, "", nil, err
+	}
+
+	current, err := currentSuffix(codexDir, candidates)
+	if err != nil {
+		return "", nil, "", nil, err
+	}
+
+	return codexDir, candidates, current, currentMetadata, nil
+}
+
+func loadSwitchState() (string, []candidate, string, error) {
+	codexDir, err := codexHome()
+	if err != nil {
+		return "", nil, "", err
+	}
+
+	candidates, err := loadCandidates(codexDir)
+	if err != nil {
+		return "", nil, "", err
+	}
+
+	current, err := currentSuffix(codexDir, candidates)
+	if err != nil {
+		return "", nil, "", err
+	}
+
+	return codexDir, candidates, current, nil
+}
+
+func isInteractiveReader(in io.Reader) bool {
+	file, ok := in.(*os.File)
+	if !ok {
+		return false
+	}
+
+	return isInteractiveInput(file)
 }
 
 func codexHome() (string, error) {
@@ -414,14 +668,25 @@ func formatRelativeAmount(delta time.Duration) string {
 }
 
 func interactiveMode(codexDir, current string, currentMetadata *authMetadata, candidates []candidate) error {
-	printStatus(os.Stdout, codexDir, current, currentMetadata, candidates)
+	return interactiveModeWithIO(codexDir, current, currentMetadata, candidates, os.Stdin, os.Stdout)
+}
+
+func interactiveModeWithIO(
+	codexDir,
+	current string,
+	currentMetadata *authMetadata,
+	candidates []candidate,
+	in io.Reader,
+	out io.Writer,
+) error {
+	printStatus(out, codexDir, current, currentMetadata, candidates)
 
 	if len(candidates) == 0 {
 		return fmt.Errorf("no auth.json.* files found in %s", codexDir)
 	}
 
-	fmt.Print("Choose auth file by number or suffix (Enter to cancel): ")
-	reader := bufio.NewReader(os.Stdin)
+	fmt.Fprint(out, "Choose auth file by number or suffix (Enter to cancel): ")
+	reader := bufio.NewReader(in)
 	selection, err := reader.ReadString('\n')
 	if err != nil && !errors.Is(err, io.EOF) {
 		return fmt.Errorf("read selection: %w", err)
@@ -429,14 +694,18 @@ func interactiveMode(codexDir, current string, currentMetadata *authMetadata, ca
 
 	selection = strings.TrimSpace(selection)
 	if selection == "" {
-		fmt.Println("Cancelled.")
+		fmt.Fprintln(out, "Cancelled.")
 		return nil
 	}
 
-	return switchTo(codexDir, current, candidates, selection)
+	return switchToWithIO(codexDir, current, candidates, out, selection)
 }
 
 func switchTo(codexDir, current string, candidates []candidate, selection string) error {
+	return switchToWithIO(codexDir, current, candidates, os.Stdout, selection)
+}
+
+func switchToWithIO(codexDir, current string, candidates []candidate, out io.Writer, selection string) error {
 	if len(candidates) == 0 {
 		return fmt.Errorf("no auth.json.* files found in %s", codexDir)
 	}
@@ -447,7 +716,7 @@ func switchTo(codexDir, current string, candidates []candidate, selection string
 	}
 
 	if current == target.Suffix {
-		fmt.Printf("Already using: %s\n", target.Suffix)
+		fmt.Fprintf(out, "Already using: %s\n", target.Suffix)
 		return nil
 	}
 
@@ -455,7 +724,7 @@ func switchTo(codexDir, current string, candidates []candidate, selection string
 		return err
 	}
 
-	fmt.Printf("Switched auth to: %s\n", target.Suffix)
+	fmt.Fprintf(out, "Switched auth to: %s\n", target.Suffix)
 	return nil
 }
 
@@ -483,33 +752,6 @@ func normalizeSelection(selection string) string {
 		return strings.TrimPrefix(selection, "auth.json.")
 	}
 	return selection
-}
-
-func validateSaveOptions(saveValue string, force bool) error {
-	if force && saveValue == "" {
-		return fmt.Errorf("use --force only with --save")
-	}
-	return nil
-}
-
-func countSelectedActions(listOnly bool, useValue, saveValue string, refresh bool) (int, error) {
-	actionCount := 0
-	if listOnly {
-		actionCount++
-	}
-	if useValue != "" {
-		actionCount++
-	}
-	if saveValue != "" {
-		actionCount++
-	}
-	if refresh {
-		actionCount++
-	}
-	if actionCount > 1 {
-		return 0, fmt.Errorf("use only one of --list, --use, --save, or --refresh")
-	}
-	return actionCount, nil
 }
 
 func saveCurrentAs(codexDir, selection string, force bool) error {
