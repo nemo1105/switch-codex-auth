@@ -47,7 +47,12 @@ Save the current `auth.json` as a new alias:
 ```bash
 switch-codex-auth --save demo
 switch-codex-auth --save auth.json.backup-20260319
+switch-codex-auth --save demo --force
 ```
+
+If the alias already exists, interactive terminals prompt you to press `Enter` to overwrite
+or type a different alias to save under. In non-interactive environments, use `--force`
+to overwrite an existing alias.
 
 ## Auth Directory
 
@@ -64,5 +69,6 @@ You can override the directory with `CODEX_HOME`.
 - Shows the number of available auth files plus relative ages for each backup's modified time, access time, and `last_refresh` when present.
 - Detects which backup currently matches `auth.json`.
 - Replaces `auth.json` through a temp file in the same directory before renaming it into place.
-- Saves a new alias with `--save <suffix>` without overwriting an existing `auth.json.<suffix>`.
+- Saves a new alias with `--save <suffix>`, prompting before overwriting an existing `auth.json.<suffix>` in interactive terminals.
+- Supports `-f` / `--force` with `--save` to overwrite an existing alias without prompting.
 - Supports number selection or suffix selection in interactive mode.

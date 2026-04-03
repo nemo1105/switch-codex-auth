@@ -198,3 +198,231 @@ func TestFormatDisplayTimeFallback(t *testing.T) {
 		t.Fatalf("unexpected future format: %q", got)
 	}
 }
+
+func TestSaveCurrentAsWithIOSavesNewAlias(t *testing.T) {
+	dir := t.TempDir()
+	writeAuthFile(t, filepath.Join(dir, "auth.json"), "active")
+
+	var out bytes.Buffer
+	if err := saveCurrentAsWithIO(dir, "demo", false, strings.NewReader(""), &out, false); err != nil {
+		t.Fatalf("saveCurrentAsWithIO: %v", err)
+	}
+
+	if got := readAuthFile(t, filepath.Join(dir, "auth.json.demo")); got != "active" {
+		t.Fatalf("unexpected saved content: %q", got)
+	}
+	if output := out.String(); !strings.Contains(output, "Saved current auth as: demo") {
+		t.Fatalf("unexpected output: %s", output)
+	}
+}
+
+func TestSaveCurrentAsWithIOPromptsAndOverwritesOnEmptyInput(t *testing.T) {
+	dir := t.TempDir()
+	writeAuthFile(t, filepath.Join(dir, "auth.json"), "active")
+	targetPath := filepath.Join(dir, "auth.json.demo")
+	writeAuthFile(t, targetPath, "old")
+
+	var out bytes.Buffer
+	if err := saveCurrentAsWithIO(dir, "demo", false, strings.NewReader("\n"), &out, true); err != nil {
+		t.Fatalf("saveCurrentAsWithIO: %v", err)
+	}
+
+	if got := readAuthFile(t, targetPath); got != "active" {
+		t.Fatalf("expected overwrite, got %q", got)
+	}
+
+	output := out.String()
+	if !strings.Contains(output, "Auth alias already exists: auth.json.demo") {
+		t.Fatalf("missing conflict output: %s", output)
+	}
+	if !strings.Contains(output, "Press Enter to overwrite, or type a different alias to save as: ") {
+		t.Fatalf("missing overwrite prompt: %s", output)
+	}
+	if !strings.Contains(output, "Overwrote auth alias: demo") {
+		t.Fatalf("missing overwrite confirmation: %s", output)
+	}
+}
+
+func TestSaveCurrentAsWithIOUsesReplacementAlias(t *testing.T) {
+	dir := t.TempDir()
+	writeAuthFile(t, filepath.Join(dir, "auth.json"), "active")
+	writeAuthFile(t, filepath.Join(dir, "auth.json.demo"), "old-demo")
+
+	var out bytes.Buffer
+	if err := saveCurrentAsWithIO(dir, "demo", false, strings.NewReader("backup2\n"), &out, true); err != nil {
+		t.Fatalf("saveCurrentAsWithIO: %v", err)
+	}
+
+	if got := readAuthFile(t, filepath.Join(dir, "auth.json.demo")); got != "old-demo" {
+		t.Fatalf("expected original alias to stay unchanged, got %q", got)
+	}
+	if got := readAuthFile(t, filepath.Join(dir, "auth.json.backup2")); got != "active" {
+		t.Fatalf("expected replacement alias content, got %q", got)
+	}
+	if output := out.String(); !strings.Contains(output, "Saved current auth as: backup2") {
+		t.Fatalf("unexpected output: %s", output)
+	}
+}
+
+func TestSaveCurrentAsWithIORepromptsOnConflictingAlias(t *testing.T) {
+	dir := t.TempDir()
+	writeAuthFile(t, filepath.Join(dir, "auth.json"), "active")
+	writeAuthFile(t, filepath.Join(dir, "auth.json.demo"), "old-demo")
+	writeAuthFile(t, filepath.Join(dir, "auth.json.other"), "old-other")
+
+	var out bytes.Buffer
+	if err := saveCurrentAsWithIO(dir, "demo", false, strings.NewReader("other\ncustom\n"), &out, true); err != nil {
+		t.Fatalf("saveCurrentAsWithIO: %v", err)
+	}
+
+	if got := readAuthFile(t, filepath.Join(dir, "auth.json.custom")); got != "active" {
+		t.Fatalf("expected final alias content, got %q", got)
+	}
+
+	output := out.String()
+	if strings.Count(output, "Auth alias already exists:") != 2 {
+		t.Fatalf("expected two conflict prompts, got output:\n%s", output)
+	}
+	if !strings.Contains(output, "auth.json.other") {
+		t.Fatalf("expected follow-up conflict for replacement alias, got output:\n%s", output)
+	}
+}
+
+func TestSaveCurrentAsWithIORepromptsOnInvalidAlias(t *testing.T) {
+	dir := t.TempDir()
+	writeAuthFile(t, filepath.Join(dir, "auth.json"), "active")
+	writeAuthFile(t, filepath.Join(dir, "auth.json.demo"), "old-demo")
+
+	var out bytes.Buffer
+	if err := saveCurrentAsWithIO(dir, "demo", false, strings.NewReader("bad/name\ncustom\n"), &out, true); err != nil {
+		t.Fatalf("saveCurrentAsWithIO: %v", err)
+	}
+
+	if got := readAuthFile(t, filepath.Join(dir, "auth.json.custom")); got != "active" {
+		t.Fatalf("expected final alias content, got %q", got)
+	}
+
+	output := out.String()
+	if !strings.Contains(output, "Invalid alias: suffix cannot contain path separators: bad/name") {
+		t.Fatalf("expected invalid alias message, got output:\n%s", output)
+	}
+}
+
+func TestSaveCurrentAsWithIOForceOverwritesWithoutPrompt(t *testing.T) {
+	dir := t.TempDir()
+	writeAuthFile(t, filepath.Join(dir, "auth.json"), "active")
+	targetPath := filepath.Join(dir, "auth.json.demo")
+	writeAuthFile(t, targetPath, "old")
+
+	var out bytes.Buffer
+	if err := saveCurrentAsWithIO(dir, "demo", true, strings.NewReader("backup\n"), &out, true); err != nil {
+		t.Fatalf("saveCurrentAsWithIO: %v", err)
+	}
+
+	if got := readAuthFile(t, targetPath); got != "active" {
+		t.Fatalf("expected force overwrite, got %q", got)
+	}
+
+	output := out.String()
+	if strings.Contains(output, "Press Enter to overwrite") {
+		t.Fatalf("force mode should not prompt, got output:\n%s", output)
+	}
+	if !strings.Contains(output, "Overwrote auth alias: demo") {
+		t.Fatalf("missing force overwrite confirmation: %s", output)
+	}
+}
+
+func TestSaveCurrentAsWithIONonInteractiveConflictRequiresForce(t *testing.T) {
+	dir := t.TempDir()
+	writeAuthFile(t, filepath.Join(dir, "auth.json"), "active")
+	targetPath := filepath.Join(dir, "auth.json.demo")
+	writeAuthFile(t, targetPath, "old")
+
+	var out bytes.Buffer
+	err := saveCurrentAsWithIO(dir, "demo", false, strings.NewReader(""), &out, false)
+	if err == nil {
+		t.Fatal("expected conflict error")
+	}
+	if !strings.Contains(err.Error(), "use --force to overwrite or choose a different alias") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := readAuthFile(t, targetPath); got != "old" {
+		t.Fatalf("target should remain unchanged, got %q", got)
+	}
+}
+
+func TestSaveCurrentAsWithIOEOFDoesNotOverwrite(t *testing.T) {
+	dir := t.TempDir()
+	writeAuthFile(t, filepath.Join(dir, "auth.json"), "active")
+	targetPath := filepath.Join(dir, "auth.json.demo")
+	writeAuthFile(t, targetPath, "old")
+
+	var out bytes.Buffer
+	err := saveCurrentAsWithIO(dir, "demo", false, strings.NewReader(""), &out, true)
+	if err == nil {
+		t.Fatal("expected EOF conflict error")
+	}
+	if !strings.Contains(err.Error(), "save cancelled before resolving existing alias") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := readAuthFile(t, targetPath); got != "old" {
+		t.Fatalf("target should remain unchanged, got %q", got)
+	}
+}
+
+func TestValidateSaveOptions(t *testing.T) {
+	tests := []struct {
+		name      string
+		saveValue string
+		force     bool
+		wantErr   string
+	}{
+		{
+			name:      "force with save is allowed",
+			saveValue: "demo",
+			force:     true,
+		},
+		{
+			name: "no force is allowed",
+		},
+		{
+			name:    "force requires save",
+			force:   true,
+			wantErr: "use --force only with --save",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateSaveOptions(tt.saveValue, tt.force)
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("validateSaveOptions: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("expected error %q", tt.wantErr)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+func writeAuthFile(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+}
+
+func readAuthFile(t *testing.T, path string) string {
+	t.Helper()
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	return string(content)
+}

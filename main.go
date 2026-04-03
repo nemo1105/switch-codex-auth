@@ -38,12 +38,17 @@ func main() {
 	listOnly := flag.Bool("list", false, "show the current auth and all available auth.json.* files")
 	useValue := flag.String("use", "", "switch to auth.json.<suffix> or the menu index")
 	saveValue := flag.String("save", "", "copy the current auth.json to auth.json.<suffix>")
+	var force bool
+	flag.BoolVar(&force, "f", false, "overwrite an existing auth alias when used with --save")
+	flag.BoolVar(&force, "force", false, "overwrite an existing auth alias when used with --save")
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(), "Usage:\n")
 		fmt.Fprintf(flag.CommandLine.Output(), "  %s\n", filepath.Base(os.Args[0]))
 		fmt.Fprintf(flag.CommandLine.Output(), "  %s --list\n", filepath.Base(os.Args[0]))
 		fmt.Fprintf(flag.CommandLine.Output(), "  %s --use <suffix-or-index>\n", filepath.Base(os.Args[0]))
-		fmt.Fprintf(flag.CommandLine.Output(), "  %s --save <suffix>\n", filepath.Base(os.Args[0]))
+		fmt.Fprintf(flag.CommandLine.Output(), "  %s --save <suffix> [-f|--force]\n", filepath.Base(os.Args[0]))
+		fmt.Fprintf(flag.CommandLine.Output(), "\nFlags:\n")
+		fmt.Fprintf(flag.CommandLine.Output(), "  -f, --force  overwrite an existing auth alias when used with --save\n")
 		fmt.Fprintf(flag.CommandLine.Output(), "\nEnvironment:\n")
 		fmt.Fprintf(flag.CommandLine.Output(), "  CODEX_HOME  Override the auth directory. Defaults to %s\n", defaultCodexHomeHint())
 	}
@@ -65,6 +70,9 @@ func main() {
 	}
 	if actionCount > 1 {
 		exitf("use only one of --list, --use, or --save")
+	}
+	if err := validateSaveOptions(*saveValue, force); err != nil {
+		exitErr(err)
 	}
 
 	codexDir, err := codexHome()
@@ -95,7 +103,7 @@ func main() {
 			exitErr(err)
 		}
 	case *saveValue != "":
-		if err := saveCurrentAs(codexDir, *saveValue); err != nil {
+		if err := saveCurrentAs(codexDir, *saveValue, force); err != nil {
 			exitErr(err)
 		}
 	default:
@@ -462,7 +470,18 @@ func normalizeSelection(selection string) string {
 	return selection
 }
 
-func saveCurrentAs(codexDir, selection string) error {
+func validateSaveOptions(saveValue string, force bool) error {
+	if force && saveValue == "" {
+		return fmt.Errorf("use --force only with --save")
+	}
+	return nil
+}
+
+func saveCurrentAs(codexDir, selection string, force bool) error {
+	return saveCurrentAsWithIO(codexDir, selection, force, os.Stdin, os.Stdout, isInteractiveInput(os.Stdin))
+}
+
+func saveCurrentAsWithIO(codexDir, selection string, force bool, in io.Reader, out io.Writer, interactive bool) error {
 	activePath := filepath.Join(codexDir, "auth.json")
 	if _, err := os.Stat(activePath); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -476,19 +495,97 @@ func saveCurrentAs(codexDir, selection string) error {
 		return err
 	}
 
-	targetPath := filepath.Join(codexDir, "auth.json."+suffix)
-	if _, err := os.Stat(targetPath); err == nil {
-		return fmt.Errorf("auth alias already exists: %s", filepath.Base(targetPath))
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("stat %s: %w", targetPath, err)
+	var reader *bufio.Reader
+	if interactive {
+		reader = bufio.NewReader(in)
 	}
 
-	if err := copyFileToTarget(activePath, targetPath, false); err != nil {
-		return err
+	for {
+		targetPath := filepath.Join(codexDir, "auth.json."+suffix)
+		if _, err := os.Stat(targetPath); err == nil {
+			switch {
+			case force:
+				if err := copyFileToTarget(activePath, targetPath, true); err != nil {
+					return err
+				}
+				fmt.Fprintf(out, "Overwrote auth alias: %s\n", suffix)
+				return nil
+			case !interactive:
+				return fmt.Errorf("auth alias already exists: %s (use --force to overwrite or choose a different alias)", filepath.Base(targetPath))
+			default:
+				nextSuffix, overwrite, err := promptForSaveConflict(reader, out, targetPath)
+				if err != nil {
+					return err
+				}
+				if overwrite {
+					if err := copyFileToTarget(activePath, targetPath, true); err != nil {
+						return err
+					}
+					fmt.Fprintf(out, "Overwrote auth alias: %s\n", suffix)
+					return nil
+				}
+				if nextSuffix == "" {
+					continue
+				}
+				suffix = nextSuffix
+				continue
+			}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("stat %s: %w", targetPath, err)
+		}
+
+		if err := copyFileToTarget(activePath, targetPath, false); err != nil {
+			return err
+		}
+
+		fmt.Fprintf(out, "Saved current auth as: %s\n", suffix)
+		return nil
+	}
+}
+
+func isInteractiveInput(file *os.File) bool {
+	info, err := file.Stat()
+	if err != nil {
+		return false
+	}
+	return info.Mode()&os.ModeCharDevice != 0
+}
+
+func promptForSaveConflict(reader *bufio.Reader, out io.Writer, targetPath string) (string, bool, error) {
+	fmt.Fprintf(out, "Auth alias already exists: %s\n", filepath.Base(targetPath))
+	fmt.Fprint(out, "Press Enter to overwrite, or type a different alias to save as: ")
+
+	selection, err := readPromptLine(reader)
+	if err != nil {
+		if errors.Is(err, io.EOF) {
+			return "", false, fmt.Errorf("save cancelled before resolving existing alias: %s", filepath.Base(targetPath))
+		}
+		return "", false, fmt.Errorf("read save selection: %w", err)
 	}
 
-	fmt.Printf("Saved current auth as: %s\n", suffix)
-	return nil
+	selection = strings.TrimSpace(selection)
+	if selection == "" {
+		return "", true, nil
+	}
+
+	suffix, err := normalizeSuffix(selection)
+	if err != nil {
+		fmt.Fprintf(out, "Invalid alias: %v\n", err)
+		return "", false, nil
+	}
+
+	return suffix, false, nil
+}
+
+func readPromptLine(reader *bufio.Reader) (string, error) {
+	selection, err := reader.ReadString('\n')
+	if err != nil {
+		if errors.Is(err, io.EOF) && selection != "" {
+			return selection, nil
+		}
+		return "", err
+	}
+	return selection, nil
 }
 
 func normalizeSuffix(selection string) (string, error) {
