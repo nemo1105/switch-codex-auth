@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"encoding/base64"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -185,6 +187,74 @@ func TestLoadAuthMetadataIgnoresInvalidLastRefreshAndKeepsCapturedTimes(t *testi
 	}
 	if metadata.HasAccessTime && metadata.AccessTime.Unix() != accessTime.Unix() {
 		t.Fatalf("unexpected access time: got %v want %v", metadata.AccessTime, accessTime)
+	}
+}
+
+func TestCurrentSuffixMatchesByExtractedEmail(t *testing.T) {
+	dir := t.TempDir()
+
+	writeJSONFile(t, filepath.Join(dir, "auth.json"), map[string]any{
+		"tokens": map[string]any{
+			"id_token": testJWT(t, map[string]any{
+				"https://api.openai.com/profile": map[string]any{
+					"email": "same@example.com",
+				},
+			}),
+			"access_token": "active-token",
+		},
+		"last_refresh": "2026-03-31T10:00:00Z",
+	})
+	writeJSONFile(t, filepath.Join(dir, "auth.json.alpha"), map[string]any{
+		"tokens": map[string]any{
+			"id_token":     testJWT(t, map[string]any{"email": "same@example.com"}),
+			"access_token": "alias-token",
+		},
+	})
+	writeJSONFile(t, filepath.Join(dir, "auth.json.beta"), map[string]any{
+		"tokens": map[string]any{
+			"id_token": testJWT(t, map[string]any{"email": "other@example.com"}),
+		},
+	})
+
+	candidates, err := loadCandidates(dir)
+	if err != nil {
+		t.Fatalf("loadCandidates: %v", err)
+	}
+
+	got, err := currentSuffix(dir, candidates)
+	if err != nil {
+		t.Fatalf("currentSuffix: %v", err)
+	}
+	if got != "alpha" {
+		t.Fatalf("unexpected current suffix: got %q want %q", got, "alpha")
+	}
+}
+
+func TestCurrentSuffixReturnsCustomUnmatchedWhenActiveEmailUnavailable(t *testing.T) {
+	dir := t.TempDir()
+
+	writeJSONFile(t, filepath.Join(dir, "auth.json"), map[string]any{
+		"tokens": map[string]any{
+			"id_token": "not-a-jwt",
+		},
+	})
+	writeJSONFile(t, filepath.Join(dir, "auth.json.alpha"), map[string]any{
+		"tokens": map[string]any{
+			"id_token": testJWT(t, map[string]any{"email": "same@example.com"}),
+		},
+	})
+
+	candidates, err := loadCandidates(dir)
+	if err != nil {
+		t.Fatalf("loadCandidates: %v", err)
+	}
+
+	got, err := currentSuffix(dir, candidates)
+	if err != nil {
+		t.Fatalf("currentSuffix: %v", err)
+	}
+	if got != "custom/unmatched" {
+		t.Fatalf("unexpected current suffix: got %q want %q", got, "custom/unmatched")
 	}
 }
 
@@ -394,4 +464,24 @@ func readAuthFile(t *testing.T, path string) string {
 		t.Fatalf("read %s: %v", path, err)
 	}
 	return string(content)
+}
+
+func testJWT(t *testing.T, claims map[string]any) string {
+	t.Helper()
+
+	header, err := json.Marshal(map[string]any{
+		"alg": "none",
+		"typ": "JWT",
+	})
+	if err != nil {
+		t.Fatalf("marshal JWT header: %v", err)
+	}
+
+	payload, err := json.Marshal(claims)
+	if err != nil {
+		t.Fatalf("marshal JWT claims: %v", err)
+	}
+
+	return base64.RawURLEncoding.EncodeToString(header) + "." +
+		base64.RawURLEncoding.EncodeToString(payload) + ".signature"
 }

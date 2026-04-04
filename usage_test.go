@@ -249,6 +249,76 @@ func TestEnrichCandidatesWithUsageDeduplicatesAndHandlesErrors(t *testing.T) {
 	}
 }
 
+func TestEnrichCandidatesWithUsageStartsRequestsInStaggeredParallel(t *testing.T) {
+	dir := t.TempDir()
+
+	writeJSONFile(t, filepath.Join(dir, "auth.json.a"), map[string]any{
+		"tokens": map[string]any{
+			"access_token": "first-token",
+		},
+	})
+	writeJSONFile(t, filepath.Join(dir, "auth.json.b"), map[string]any{
+		"tokens": map[string]any{
+			"access_token": "second-token",
+		},
+	})
+
+	var (
+		mu         sync.Mutex
+		startTimes = map[string]time.Time{}
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authHeader := strings.TrimSpace(r.Header.Get("Authorization"))
+
+		mu.Lock()
+		startTimes[authHeader] = time.Now()
+		mu.Unlock()
+
+		time.Sleep(200 * time.Millisecond)
+		writeJSONResponse(t, w, map[string]any{
+			"plan_type": "pro",
+			"rate_limit": map[string]any{
+				"primary_window": map[string]any{
+					"used_percent":         42,
+					"limit_window_seconds": 300,
+					"reset_at":             123,
+				},
+			},
+		})
+	}))
+	t.Cleanup(server.Close)
+	setUsageBaseURLForTest(t, server.URL+"/backend-api")
+
+	candidates, err := loadCandidates(dir)
+	if err != nil {
+		t.Fatalf("loadCandidates: %v", err)
+	}
+
+	start := time.Now()
+	enrichCandidatesWithUsage(candidates)
+	elapsed := time.Since(start)
+
+	mu.Lock()
+	firstStart, firstOK := startTimes["Bearer first-token"]
+	secondStart, secondOK := startTimes["Bearer second-token"]
+	mu.Unlock()
+
+	if !firstOK || !secondOK {
+		t.Fatalf("expected both requests to start, got %#v", startTimes)
+	}
+
+	gap := secondStart.Sub(firstStart)
+	if gap < 40*time.Millisecond {
+		t.Fatalf("expected at least 40ms stagger, got %v", gap)
+	}
+	if gap > 170*time.Millisecond {
+		t.Fatalf("expected overlapping requests instead of serial starts, got %v", gap)
+	}
+	if elapsed > 360*time.Millisecond {
+		t.Fatalf("expected staggered parallel runtime, got %v", elapsed)
+	}
+}
+
 func int64Ptr(value int64) *int64 {
 	return &value
 }

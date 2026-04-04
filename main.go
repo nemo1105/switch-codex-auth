@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"bytes"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -126,12 +125,12 @@ func runSaveSubcommand(args []string, in io.Reader, out io.Writer, prog string) 
 }
 
 func runRefreshSubcommand(args []string, out io.Writer, prog string) error {
-	handled, err := parseNoArgSubcommand("refresh", args, out, prog, writeRefreshUsage)
+	days, handled, err := parseRefreshSubcommandArgs(args, out, prog)
 	if handled || err != nil {
 		return err
 	}
 
-	return runRefreshCommand(out)
+	return runRefreshCommand(out, days)
 }
 
 func runInteractiveCommand(in io.Reader, out io.Writer) error {
@@ -171,7 +170,7 @@ func runSaveCommand(selection string, force bool, in io.Reader, out io.Writer) e
 	return saveCurrentAsWithIO(codexDir, selection, force, in, out, isInteractiveReader(in))
 }
 
-func runRefreshCommand(out io.Writer) error {
+func runRefreshCommand(out io.Writer, days int) error {
 	codexDir, err := codexHome()
 	if err != nil {
 		return err
@@ -182,7 +181,7 @@ func runRefreshCommand(out io.Writer) error {
 		return err
 	}
 
-	return refreshAuthAliases(out, codexDir, candidates)
+	return refreshAuthAliases(out, codexDir, candidates, days)
 }
 
 func parseNoArgSubcommand(
@@ -257,6 +256,30 @@ func parseSaveSubcommandArgs(args []string, out io.Writer, prog string) (string,
 	}
 }
 
+func parseRefreshSubcommandArgs(args []string, out io.Writer, prog string) (int, bool, error) {
+	flagSet := flag.NewFlagSet("refresh", flag.ContinueOnError)
+	flagSet.SetOutput(io.Discard)
+
+	days := defaultRefreshMinAgeDays
+	flagSet.IntVar(&days, "days", defaultRefreshMinAgeDays, "minimum age in days since last_refresh")
+
+	if err := flagSet.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			writeRefreshUsage(out, prog)
+			return 0, true, nil
+		}
+		return 0, false, fmt.Errorf("%v (run `%s help refresh` for usage)", err, prog)
+	}
+	if flagSet.NArg() != 0 {
+		return 0, false, fmt.Errorf("refresh does not accept arguments (usage: %s refresh [--days N])", prog)
+	}
+	if days < 0 {
+		return 0, false, fmt.Errorf("refresh days must be >= 0 (usage: %s refresh [--days N])", prog)
+	}
+
+	return days, false, nil
+}
+
 func normalizeSaveArgs(args []string) []string {
 	flags := make([]string, 0, len(args))
 	positionals := make([]string, 0, len(args))
@@ -301,13 +324,13 @@ func writeRootUsage(w io.Writer, prog string) {
 	fmt.Fprintf(w, "  %s list\n", prog)
 	fmt.Fprintf(w, "  %s use <suffix-or-index>\n", prog)
 	fmt.Fprintf(w, "  %s save <suffix> [-f|--force]\n", prog)
-	fmt.Fprintf(w, "  %s refresh\n", prog)
+	fmt.Fprintf(w, "  %s refresh [--days N]\n", prog)
 	fmt.Fprintf(w, "  %s help [command]\n", prog)
 	fmt.Fprintf(w, "\nCommands:\n")
 	fmt.Fprintf(w, "  list     Show the current auth, auth.json.* files, and live usage summaries\n")
 	fmt.Fprintf(w, "  use      Switch to auth.json.<suffix> or a menu index\n")
 	fmt.Fprintf(w, "  save     Copy the current auth.json to auth.json.<suffix>\n")
-	fmt.Fprintf(w, "  refresh  Refresh all refreshable auth.json.* files\n")
+	fmt.Fprintf(w, "  refresh  Refresh auth.json.* files whose last_refresh is at least N days old (default 7)\n")
 	fmt.Fprintf(w, "\nEnvironment:\n")
 	fmt.Fprintf(w, "  CODEX_HOME  Override the auth directory. Defaults to %s\n", defaultCodexHomeHint())
 }
@@ -329,7 +352,7 @@ func writeSaveUsage(w io.Writer, prog string) {
 
 func writeRefreshUsage(w io.Writer, prog string) {
 	fmt.Fprintf(w, "Usage:\n")
-	fmt.Fprintf(w, "  %s refresh\n", prog)
+	fmt.Fprintf(w, "  %s refresh [--days N]\n", prog)
 }
 
 func loadInteractiveState() (string, []candidate, string, *authMetadata, error) {
@@ -509,20 +532,27 @@ func readLastRefresh(path string) (time.Time, bool) {
 
 func currentSuffix(codexDir string, candidates []candidate) (string, error) {
 	activePath := filepath.Join(codexDir, "auth.json")
-	activeBytes, err := os.ReadFile(activePath)
-	if err != nil {
+	if _, err := os.Stat(activePath); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return "none", nil
 		}
-		return "", fmt.Errorf("read %s: %w", activePath, err)
+		return "", fmt.Errorf("stat %s: %w", activePath, err)
+	}
+
+	activeEmail, ok, err := extractComparableEmailFromAuthJSON(activePath)
+	if err != nil {
+		return "", err
+	}
+	if !ok {
+		return "custom/unmatched", nil
 	}
 
 	for _, candidate := range candidates {
-		candidateBytes, err := os.ReadFile(candidate.Path)
+		candidateEmail, ok, err := extractComparableEmailFromAuthJSON(candidate.Path)
 		if err != nil {
-			return "", fmt.Errorf("read %s: %w", candidate.Path, err)
+			return "", err
 		}
-		if bytes.Equal(activeBytes, candidateBytes) {
+		if ok && candidateEmail == activeEmail {
 			return candidate.Suffix, nil
 		}
 	}

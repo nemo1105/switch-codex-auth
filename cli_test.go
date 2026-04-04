@@ -24,11 +24,13 @@ func TestRunCLIBareCommandUsesInteractiveMode(t *testing.T) {
 	t.Setenv("CODEX_HOME", dir)
 	writeJSONFile(t, filepath.Join(dir, "auth.json"), map[string]any{
 		"tokens": map[string]any{
+			"id_token":     testJWT(t, map[string]any{"email": "demo@example.com"}),
 			"access_token": "interactive-token",
 		},
 	})
 	writeJSONFile(t, filepath.Join(dir, "auth.json.demo"), map[string]any{
 		"tokens": map[string]any{
+			"id_token":     testJWT(t, map[string]any{"email": "demo@example.com"}),
 			"access_token": "interactive-token",
 		},
 	})
@@ -83,12 +85,14 @@ func TestRunCLIListCommandDisplaysStatus(t *testing.T) {
 	t.Setenv("CODEX_HOME", dir)
 	writeJSONFile(t, filepath.Join(dir, "auth.json"), map[string]any{
 		"tokens": map[string]any{
+			"id_token":     testJWT(t, map[string]any{"email": "demo@example.com"}),
 			"access_token": "demo-token",
 			"account_id":   "acct-demo",
 		},
 	})
 	writeJSONFile(t, filepath.Join(dir, "auth.json.demo"), map[string]any{
 		"tokens": map[string]any{
+			"id_token":     testJWT(t, map[string]any{"email": "demo@example.com"}),
 			"access_token": "demo-token",
 			"account_id":   "acct-demo",
 		},
@@ -248,6 +252,63 @@ func TestRunCLIRefreshCommandDispatches(t *testing.T) {
 	}
 	if !strings.Contains(output, "Summary: 1 refreshed, 0 skipped, 0 failed") {
 		t.Fatalf("expected refresh summary, got:\n%s", output)
+	}
+}
+
+func TestRunCLIRefreshCommandSupportsDaysFlag(t *testing.T) {
+	fixedNow := time.Date(2026, 4, 10, 9, 0, 0, 0, time.UTC)
+	oldNow := nowFunc
+	nowFunc = func() time.Time { return fixedNow }
+	t.Cleanup(func() {
+		nowFunc = oldNow
+	})
+
+	dir := t.TempDir()
+	t.Setenv("CODEX_HOME", dir)
+	setUsageBaseURLForTest(t, "")
+
+	writeJSONFile(t, filepath.Join(dir, "auth.json.demo"), map[string]any{
+		"tokens": map[string]any{
+			"id_token":      "old-id",
+			"access_token":  "old-access",
+			"refresh_token": "demo-rt",
+		},
+		"last_refresh": "2026-04-08T09:00:00Z",
+	})
+
+	var called bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		writeJSONResponse(t, w, map[string]any{
+			"id_token":      "new-id",
+			"access_token":  "new-access",
+			"refresh_token": "new-rt",
+		})
+	}))
+	t.Cleanup(server.Close)
+	t.Setenv(refreshTokenURLOverrideEnv, server.URL)
+
+	var out bytes.Buffer
+	if err := runCLI([]string{"refresh", "--days", "1"}, strings.NewReader(""), &out); err != nil {
+		t.Fatalf("runCLI: %v", err)
+	}
+
+	if !called {
+		t.Fatal("expected refresh request to be sent")
+	}
+	if output := out.String(); !strings.Contains(output, "Summary: 1 refreshed, 0 skipped, 0 failed") {
+		t.Fatalf("expected refresh summary, got:\n%s", output)
+	}
+}
+
+func TestRunCLIRefreshCommandRejectsNegativeDays(t *testing.T) {
+	var out bytes.Buffer
+	err := runCLI([]string{"refresh", "--days", "-1"}, strings.NewReader(""), &out)
+	if err == nil {
+		t.Fatal("expected negative days error")
+	}
+	if !strings.Contains(err.Error(), "refresh days must be >= 0") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 

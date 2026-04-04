@@ -12,12 +12,14 @@ import (
 	"runtime/debug"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
 const (
 	defaultUsageBaseURL        = "https://chatgpt.com/backend-api"
 	defaultUsageRequestTimeout = 5 * time.Second
+	usageRequestStagger        = 50 * time.Millisecond
 	usagePercentWidth          = 4
 	usageDurationWidth         = 6
 )
@@ -181,14 +183,43 @@ func enrichCandidatesWithUsage(candidates []candidate) []candidate {
 		return enriched
 	}
 
-	for _, key := range requestOrder {
-		snapshots, err := requestAccountUsage(client, requestGroups[key].auth)
-		summary := formatUsageError(err)
-		if err == nil {
-			summary = formatUsageSummary(snapshots)
-		}
-		for _, index := range requestGroups[key].indexes {
-			enriched[index].Usage = summary
+	type usageRequestResult struct {
+		key     string
+		summary string
+	}
+
+	results := make(chan usageRequestResult, len(requestOrder))
+	var wg sync.WaitGroup
+
+	for i, key := range requestOrder {
+		wg.Add(1)
+		go func(i int, key string) {
+			defer wg.Done()
+
+			if delay := time.Duration(i) * usageRequestStagger; delay > 0 {
+				timer := time.NewTimer(delay)
+				defer timer.Stop()
+				<-timer.C
+			}
+
+			snapshots, err := requestAccountUsage(client, requestGroups[key].auth)
+			summary := formatUsageError(err)
+			if err == nil {
+				summary = formatUsageSummary(snapshots)
+			}
+			results <- usageRequestResult{
+				key:     key,
+				summary: summary,
+			}
+		}(i, key)
+	}
+
+	wg.Wait()
+	close(results)
+
+	for result := range results {
+		for _, index := range requestGroups[result.key].indexes {
+			enriched[index].Usage = result.summary
 		}
 	}
 

@@ -61,10 +61,13 @@ Refresh every refreshable `auth.json.*` alias:
 
 ```bash
 switch-codex-auth refresh
+switch-codex-auth refresh --days 30
 ```
 
 `refresh` only updates alias files, never the active `auth.json`. It skips aliases that
-are not refreshable and prints a summary of refreshed, skipped, and failed files.
+are not refreshable, and by default only refreshes aliases whose `last_refresh` is at
+least 7 days old or missing. Use `--days N` to override that threshold, including `0`
+to force-refresh every refreshable alias.
 
 ## Auth Directory
 
@@ -85,5 +88,5 @@ You can override the directory with `CODEX_HOME`.
 - Supports `list`, `use`, `save`, and `refresh` as explicit subcommands.
 - Saves a new alias with `save <suffix>`, prompting before overwriting an existing `auth.json.<suffix>` in interactive terminals.
 - Supports `-f` / `--force` with `save` to overwrite an existing alias without prompting.
-- Refreshes all refreshable `auth.json.*` aliases with `refresh`, grouping identical `refresh_token` values so the same token is refreshed only once.
+- Refreshes `auth.json.*` aliases with `refresh`, defaulting to entries whose `last_refresh` is at least 7 days old or missing, and grouping identical `refresh_token` values so the same token is refreshed only once.
 - Supports number selection or suffix selection in interactive mode.

@@ -31,6 +31,7 @@ const (
 	defaultComputedUserAgentVersion = "0.0.0"
 	defaultRequestTimeout           = 30 * time.Second
 	defaultAuthFilePermission       = 0o600
+	defaultRefreshMinAgeDays        = 7
 )
 
 type authPayload struct {
@@ -104,9 +105,12 @@ type refreshResult struct {
 	Message string
 }
 
-func refreshAuthAliases(w io.Writer, codexDir string, candidates []candidate) error {
+func refreshAuthAliases(w io.Writer, codexDir string, candidates []candidate, minAgeDays int) error {
 	if len(candidates) == 0 {
 		return fmt.Errorf("no auth.json.* files found in %s", codexDir)
+	}
+	if minAgeDays < 0 {
+		return fmt.Errorf("refresh days must be >= 0")
 	}
 
 	fmt.Fprintf(w, "Refreshing auth aliases in: %s\n", codexDir)
@@ -115,6 +119,9 @@ func refreshAuthAliases(w io.Writer, codexDir string, candidates []candidate) er
 	documents := make([]*authDocument, len(candidates))
 	groups := make(map[string][]int)
 	tokenOrder := make([]string, 0)
+	groupNeedsRefresh := make(map[string]bool)
+	skipReasons := make([]string, len(candidates))
+	refreshedNow := nowFunc().UTC()
 
 	for i, candidate := range candidates {
 		doc, err := loadAuthDocument(candidate.Path)
@@ -153,17 +160,36 @@ func refreshAuthAliases(w io.Writer, codexDir string, candidates []candidate) er
 		}
 
 		documents[i] = &doc
+		shouldRefresh, skipReason := shouldRefreshAlias(doc.parsed.LastRefresh, refreshedNow, minAgeDays)
+		skipReasons[i] = skipReason
 		if _, ok := groups[refreshToken]; !ok {
 			tokenOrder = append(tokenOrder, refreshToken)
 		}
 		groups[refreshToken] = append(groups[refreshToken], i)
+		if shouldRefresh {
+			groupNeedsRefresh[refreshToken] = true
+		}
 	}
 
-	if len(tokenOrder) != 0 {
+	refreshTokens := make([]string, 0, len(tokenOrder))
+	for _, token := range tokenOrder {
+		if groupNeedsRefresh[token] {
+			refreshTokens = append(refreshTokens, token)
+			continue
+		}
+		for _, index := range groups[token] {
+			results[index] = refreshResult{
+				Status:  refreshResultSkipped,
+				Message: skipReasons[index],
+			}
+		}
+	}
+
+	if len(refreshTokens) != 0 {
 		cfg := defaultRefreshConfig()
 		client, err := buildHTTPClient(cfg)
 		if err != nil {
-			for _, token := range tokenOrder {
+			for _, token := range refreshTokens {
 				for _, index := range groups[token] {
 					results[index] = refreshResult{
 						Status:  refreshResultFailed,
@@ -172,7 +198,7 @@ func refreshAuthAliases(w io.Writer, codexDir string, candidates []candidate) er
 				}
 			}
 		} else {
-			for _, token := range tokenOrder {
+			for _, token := range refreshTokens {
 				response, err := requestChatGPTTokenRefresh(client, cfg, token)
 				if err != nil {
 					for _, index := range groups[token] {
@@ -184,7 +210,6 @@ func refreshAuthAliases(w io.Writer, codexDir string, candidates []candidate) er
 					continue
 				}
 
-				refreshedAt := nowFunc().UTC()
 				for _, index := range groups[token] {
 					doc := documents[index]
 					if doc == nil {
@@ -195,7 +220,7 @@ func refreshAuthAliases(w io.Writer, codexDir string, candidates []candidate) er
 						continue
 					}
 
-					if err := doc.applyRefresh(response, refreshedAt); err != nil {
+					if err := doc.applyRefresh(response, refreshedNow); err != nil {
 						results[index] = refreshResult{
 							Status:  refreshResultFailed,
 							Message: err.Error(),
@@ -213,7 +238,7 @@ func refreshAuthAliases(w io.Writer, codexDir string, candidates []candidate) er
 
 					results[index] = refreshResult{
 						Status:  refreshResultRefreshed,
-						Message: fmt.Sprintf("last_refresh=%s", refreshedAt.Format(time.RFC3339)),
+						Message: fmt.Sprintf("last_refresh=%s", formatRefreshAge(refreshedNow, nowFunc().UTC())),
 					}
 				}
 			}
@@ -255,6 +280,31 @@ func refreshAuthAliases(w io.Writer, codexDir string, candidates []candidate) er
 	}
 
 	return nil
+}
+
+func shouldRefreshAlias(lastRefresh *time.Time, now time.Time, minAgeDays int) (bool, string) {
+	if minAgeDays == 0 {
+		return true, ""
+	}
+	if lastRefresh == nil || lastRefresh.IsZero() {
+		return true, ""
+	}
+
+	last := lastRefresh.UTC()
+	threshold := now.Add(-time.Duration(minAgeDays) * 24 * time.Hour)
+	if last.After(threshold) {
+		return false, fmt.Sprintf("last_refresh=%s is newer than %dd threshold", formatRefreshAge(last, now), minAgeDays)
+	}
+
+	return true, ""
+}
+
+func formatRefreshAge(value, now time.Time) string {
+	delta := now.Sub(value)
+	if delta < 0 {
+		delta = -delta
+	}
+	return formatRelativeAmount(delta)
 }
 
 func loadAuthDocument(path string) (authDocument, error) {

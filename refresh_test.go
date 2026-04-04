@@ -118,7 +118,7 @@ func TestRefreshAuthAliasesRefreshesGroupsSkipsFailuresAndLeavesActiveAuthUnchan
 	}
 
 	var out bytes.Buffer
-	err = refreshAuthAliases(&out, dir, candidates)
+	err = refreshAuthAliases(&out, dir, candidates, defaultRefreshMinAgeDays)
 	if err == nil {
 		t.Fatal("expected aggregate refresh error")
 	}
@@ -185,9 +185,9 @@ func TestRefreshAuthAliasesRefreshesGroupsSkipsFailuresAndLeavesActiveAuthUnchan
 
 	output := out.String()
 	for _, want := range []string{
-		"[refreshed] auth.json.a: last_refresh=2026-04-03T14:30:00Z",
-		"[refreshed] auth.json.b: last_refresh=2026-04-03T14:30:00Z",
-		"[refreshed] auth.json.solo: last_refresh=2026-04-03T14:30:00Z",
+		"[refreshed] auth.json.a: last_refresh=<1m",
+		"[refreshed] auth.json.b: last_refresh=<1m",
+		"[refreshed] auth.json.solo: last_refresh=<1m",
 		"[skipped] auth.json.apikey: auth_mode resolves to \"apikey\"",
 		"[skipped] auth.json.notokens: auth.json does not contain tokens",
 		"[skipped] auth.json.norefresh: auth.json does not contain a refresh_token",
@@ -227,7 +227,7 @@ func TestRefreshAuthAliasesClassifiesPermanent401Failures(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	err = refreshAuthAliases(&out, dir, candidates)
+	err = refreshAuthAliases(&out, dir, candidates, defaultRefreshMinAgeDays)
 	if err == nil {
 		t.Fatal("expected refresh failure")
 	}
@@ -243,6 +243,141 @@ func TestRefreshAuthAliasesClassifiesPermanent401Failures(t *testing.T) {
 	revoked := readJSONFile(t, filepath.Join(dir, "auth.json.revoked"))
 	if _, ok := revoked["last_refresh"]; ok {
 		t.Fatalf("revoked auth should not gain last_refresh: %#v", revoked)
+	}
+}
+
+func TestRefreshAuthAliasesHonorsLastRefreshThresholdAndSharedTokenGroups(t *testing.T) {
+	dir := t.TempDir()
+
+	fixedNow := time.Date(2026, 4, 10, 9, 0, 0, 0, time.UTC)
+	oldNow := nowFunc
+	nowFunc = func() time.Time { return fixedNow }
+	t.Cleanup(func() {
+		nowFunc = oldNow
+	})
+
+	writeJSONFile(t, filepath.Join(dir, "auth.json.old"), map[string]any{
+		"tokens": map[string]any{
+			"id_token":      "old-id",
+			"access_token":  "old-access",
+			"refresh_token": "shared-rt",
+		},
+		"last_refresh": "2026-04-01T09:00:00Z",
+	})
+	writeJSONFile(t, filepath.Join(dir, "auth.json.recent-shared"), map[string]any{
+		"tokens": map[string]any{
+			"id_token":      "recent-shared-id",
+			"access_token":  "recent-shared-access",
+			"refresh_token": "shared-rt",
+		},
+		"last_refresh": "2026-04-08T09:00:00Z",
+	})
+	writeJSONFile(t, filepath.Join(dir, "auth.json.recent-solo"), map[string]any{
+		"tokens": map[string]any{
+			"id_token":      "recent-solo-id",
+			"access_token":  "recent-solo-access",
+			"refresh_token": "recent-rt",
+		},
+		"last_refresh": "2026-04-08T09:00:00Z",
+	})
+	writeJSONFile(t, filepath.Join(dir, "auth.json.missing"), map[string]any{
+		"tokens": map[string]any{
+			"id_token":      "missing-id",
+			"access_token":  "missing-access",
+			"refresh_token": "missing-rt",
+		},
+	})
+
+	var (
+		mu     sync.Mutex
+		counts = map[string]int{}
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req refreshRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+
+		mu.Lock()
+		counts[req.RefreshToken]++
+		mu.Unlock()
+
+		switch req.RefreshToken {
+		case "shared-rt":
+			writeJSONResponse(t, w, map[string]any{
+				"id_token":      "shared-new-id",
+				"access_token":  "shared-new-access",
+				"refresh_token": "shared-new-rt",
+			})
+		case "missing-rt":
+			writeJSONResponse(t, w, map[string]any{
+				"id_token":      "missing-new-id",
+				"access_token":  "missing-new-access",
+				"refresh_token": "missing-new-rt",
+			})
+		default:
+			t.Fatalf("unexpected refresh token: %s", req.RefreshToken)
+		}
+	}))
+	t.Cleanup(server.Close)
+	t.Setenv(refreshTokenURLOverrideEnv, server.URL)
+
+	candidates, err := loadCandidates(dir)
+	if err != nil {
+		t.Fatalf("loadCandidates: %v", err)
+	}
+
+	var out bytes.Buffer
+	if err := refreshAuthAliases(&out, dir, candidates, defaultRefreshMinAgeDays); err != nil {
+		t.Fatalf("refreshAuthAliases: %v", err)
+	}
+
+	mu.Lock()
+	if counts["shared-rt"] != 1 {
+		t.Fatalf("expected one shared refresh request, got %d", counts["shared-rt"])
+	}
+	if counts["missing-rt"] != 1 {
+		t.Fatalf("expected one missing refresh request, got %d", counts["missing-rt"])
+	}
+	if counts["recent-rt"] != 0 {
+		t.Fatalf("expected recent token to be skipped, got %d", counts["recent-rt"])
+	}
+	mu.Unlock()
+
+	oldAlias := readJSONFile(t, filepath.Join(dir, "auth.json.old"))
+	if got := nestedMap(t, oldAlias, "tokens")["refresh_token"]; got != "shared-new-rt" {
+		t.Fatalf("unexpected old alias refresh_token: %#v", got)
+	}
+
+	recentShared := readJSONFile(t, filepath.Join(dir, "auth.json.recent-shared"))
+	if got := nestedMap(t, recentShared, "tokens")["refresh_token"]; got != "shared-new-rt" {
+		t.Fatalf("unexpected recent shared alias refresh_token: %#v", got)
+	}
+
+	recentSolo := readJSONFile(t, filepath.Join(dir, "auth.json.recent-solo"))
+	if got := nestedMap(t, recentSolo, "tokens")["refresh_token"]; got != "recent-rt" {
+		t.Fatalf("recent solo alias should be unchanged, got %#v", got)
+	}
+	if got := recentSolo["last_refresh"]; got != "2026-04-08T09:00:00Z" {
+		t.Fatalf("recent solo last_refresh should remain unchanged, got %#v", got)
+	}
+
+	missingAlias := readJSONFile(t, filepath.Join(dir, "auth.json.missing"))
+	if got := nestedMap(t, missingAlias, "tokens")["refresh_token"]; got != "missing-new-rt" {
+		t.Fatalf("unexpected missing alias refresh_token: %#v", got)
+	}
+
+	output := out.String()
+	for _, want := range []string{
+		"[refreshed] auth.json.old: last_refresh=<1m",
+		"[refreshed] auth.json.recent-shared: last_refresh=<1m",
+		"[refreshed] auth.json.missing: last_refresh=<1m",
+		"[skipped] auth.json.recent-solo: last_refresh=2d is newer than 7d threshold",
+		"Summary: 3 refreshed, 1 skipped, 0 failed",
+	} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("output missing %q\nfull output:\n%s", want, output)
+		}
 	}
 }
 
@@ -282,7 +417,7 @@ func TestRefreshAuthAliasesReportsWriteFailures(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	err = refreshAuthAliases(&out, dir, candidates)
+	err = refreshAuthAliases(&out, dir, candidates, defaultRefreshMinAgeDays)
 	if err == nil {
 		t.Fatal("expected write failure")
 	}
