@@ -22,6 +22,7 @@ type candidate struct {
 	Suffix   string
 	Path     string
 	Metadata authMetadata
+	Usage    string
 }
 
 type authMetadata struct {
@@ -33,6 +34,7 @@ type authMetadata struct {
 }
 
 var nowFunc = time.Now
+var enrichCandidatesWithUsageFunc = enrichCandidatesWithUsage
 
 func main() {
 	if err := runCLI(os.Args[1:], os.Stdin, os.Stdout); err != nil {
@@ -302,7 +304,7 @@ func writeRootUsage(w io.Writer, prog string) {
 	fmt.Fprintf(w, "  %s refresh\n", prog)
 	fmt.Fprintf(w, "  %s help [command]\n", prog)
 	fmt.Fprintf(w, "\nCommands:\n")
-	fmt.Fprintf(w, "  list     Show the current auth and all available auth.json.* files\n")
+	fmt.Fprintf(w, "  list     Show the current auth, auth.json.* files, and live usage summaries\n")
 	fmt.Fprintf(w, "  use      Switch to auth.json.<suffix> or a menu index\n")
 	fmt.Fprintf(w, "  save     Copy the current auth.json to auth.json.<suffix>\n")
 	fmt.Fprintf(w, "  refresh  Refresh all refreshable auth.json.* files\n")
@@ -350,6 +352,8 @@ func loadInteractiveState() (string, []candidate, string, *authMetadata, error) 
 	if err != nil {
 		return "", nil, "", nil, err
 	}
+
+	candidates = enrichCandidatesWithUsageFunc(candidates)
 
 	return codexDir, candidates, current, currentMetadata, nil
 }
@@ -528,7 +532,6 @@ func currentSuffix(codexDir string, candidates []candidate) (string, error) {
 
 func printStatus(w io.Writer, codexDir, current string, currentMetadata *authMetadata, candidates []candidate) {
 	fmt.Fprintf(w, "Auth dir: %s\n", codexDir)
-	fmt.Fprintf(w, "Current auth: %s\n", current)
 
 	if current == "custom/unmatched" && currentMetadata != nil {
 		fmt.Fprintf(
@@ -547,35 +550,32 @@ func printStatus(w io.Writer, codexDir, current string, currentMetadata *authMet
 	}
 
 	type candidateRow struct {
+		marker      string
 		index       string
-		current     string
 		suffix      string
-		modified    string
-		accessed    string
 		lastRefresh string
+		usage       string
 	}
 
 	rows := make([]candidateRow, 0, len(candidates))
 	indexWidth := len("#")
-	currentWidth := len("Current")
 	suffixWidth := len("Suffix")
-	modifiedWidth := len("Modified")
-	accessedWidth := len("Accessed")
 	lastRefreshWidth := len("Last refresh")
+	usageWidth := len("Usage")
 
 	for i, candidate := range candidates {
-		marker := ""
+		marker := " "
 		if candidate.Suffix == current {
 			marker = "*"
 		}
+		index := strconv.Itoa(i + 1)
 
 		row := candidateRow{
-			index:       strconv.Itoa(i + 1),
-			current:     marker,
+			marker:      marker,
+			index:       index,
 			suffix:      candidate.Suffix,
-			modified:    formatDisplayTime(candidate.Metadata.ModTime, true),
-			accessed:    formatDisplayTime(candidate.Metadata.AccessTime, candidate.Metadata.HasAccessTime),
 			lastRefresh: formatDisplayTime(candidate.Metadata.LastRefresh, candidate.Metadata.HasLastRefresh),
+			usage:       formatUsageDisplay(candidate.Usage),
 		}
 		rows = append(rows, row)
 
@@ -585,54 +585,55 @@ func printStatus(w io.Writer, codexDir, current string, currentMetadata *authMet
 		if len(row.suffix) > suffixWidth {
 			suffixWidth = len(row.suffix)
 		}
-		if len(row.modified) > modifiedWidth {
-			modifiedWidth = len(row.modified)
-		}
-		if len(row.accessed) > accessedWidth {
-			accessedWidth = len(row.accessed)
-		}
 		if len(row.lastRefresh) > lastRefreshWidth {
 			lastRefreshWidth = len(row.lastRefresh)
+		}
+		if len(row.usage) > usageWidth {
+			usageWidth = len(row.usage)
 		}
 	}
 
 	fmt.Fprintf(
 		w,
-		"  %-*s %-*s %-*s %-*s %-*s %-*s\n",
+		" %1s %-*s %-*s %-*s %-*s\n",
+		" ",
 		indexWidth,
 		"#",
-		currentWidth,
-		"Current",
 		suffixWidth,
 		"Suffix",
-		modifiedWidth,
-		"Modified",
-		accessedWidth,
-		"Accessed",
 		lastRefreshWidth,
 		"Last refresh",
+		usageWidth,
+		"Usage",
 	)
 
 	for _, row := range rows {
 		fmt.Fprintf(
 			w,
-			"  %-*s %-*s %-*s %-*s %-*s %-*s\n",
+			" %1s %-*s %-*s %-*s %-*s\n",
+			row.marker,
 			indexWidth,
 			row.index,
-			currentWidth,
-			row.current,
 			suffixWidth,
 			row.suffix,
-			modifiedWidth,
-			row.modified,
-			accessedWidth,
-			row.accessed,
 			lastRefreshWidth,
 			row.lastRefresh,
+			usageWidth,
+			row.usage,
 		)
 	}
 
-	fmt.Fprintln(w, "Hint: newer last_refresh and access times usually mean more recent activity, but they do not guarantee remaining quota or validity.")
+	fmt.Fprintln(w, "Hint:")
+	fmt.Fprintln(w, "  * marks the current alias")
+	fmt.Fprintln(w, "  Last refresh is a local file signal")
+	fmt.Fprintln(w, "  Usage is live account data and may show n/a or a concise error per alias")
+}
+
+func formatUsageDisplay(value string) string {
+	if strings.TrimSpace(value) == "" {
+		return "-"
+	}
+	return value
 }
 
 func formatDisplayTime(value time.Time, ok bool) string {

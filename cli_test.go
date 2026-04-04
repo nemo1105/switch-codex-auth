@@ -9,14 +9,44 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestRunCLIBareCommandUsesInteractiveMode(t *testing.T) {
+	fixedNow := time.Date(2026, 4, 4, 12, 0, 0, 0, time.UTC)
+	oldNow := nowFunc
+	nowFunc = func() time.Time { return fixedNow }
+	t.Cleanup(func() {
+		nowFunc = oldNow
+	})
+
 	dir := t.TempDir()
 	t.Setenv("CODEX_HOME", dir)
+	writeJSONFile(t, filepath.Join(dir, "auth.json"), map[string]any{
+		"tokens": map[string]any{
+			"access_token": "interactive-token",
+		},
+	})
+	writeJSONFile(t, filepath.Join(dir, "auth.json.demo"), map[string]any{
+		"tokens": map[string]any{
+			"access_token": "interactive-token",
+		},
+	})
 
-	writeAuthFile(t, filepath.Join(dir, "auth.json"), "demo-auth")
-	writeAuthFile(t, filepath.Join(dir, "auth.json.demo"), "demo-auth")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeJSONResponse(t, w, map[string]any{
+			"plan_type": "plus",
+			"rate_limit": map[string]any{
+				"primary_window": map[string]any{
+					"used_percent":         25,
+					"limit_window_seconds": 900,
+					"reset_at":             fixedNow.Add(3 * time.Minute).Unix(),
+				},
+			},
+		})
+	}))
+	t.Cleanup(server.Close)
+	setUsageBaseURLForTest(t, server.URL+"/backend-api")
 
 	var out bytes.Buffer
 	if err := runCLI(nil, strings.NewReader("\n"), &out); err != nil {
@@ -24,8 +54,14 @@ func TestRunCLIBareCommandUsesInteractiveMode(t *testing.T) {
 	}
 
 	output := out.String()
-	if !strings.Contains(output, "Current auth: demo") {
-		t.Fatalf("expected current auth in output, got:\n%s", output)
+	if strings.Contains(output, "Current auth:") {
+		t.Fatalf("did not expect current auth line, got:\n%s", output)
+	}
+	if !strings.Contains(output, " * 1 demo") {
+		t.Fatalf("expected current alias marker in output, got:\n%s", output)
+	}
+	if !strings.Contains(output, "Plus |  75% left in     3m") {
+		t.Fatalf("expected usage summary in output, got:\n%s", output)
 	}
 	if !strings.Contains(output, "Choose auth file by number or suffix (Enter to cancel): ") {
 		t.Fatalf("expected interactive prompt, got:\n%s", output)
@@ -36,11 +72,68 @@ func TestRunCLIBareCommandUsesInteractiveMode(t *testing.T) {
 }
 
 func TestRunCLIListCommandDisplaysStatus(t *testing.T) {
+	fixedNow := time.Date(2026, 4, 4, 12, 0, 0, 0, time.UTC)
+	oldNow := nowFunc
+	nowFunc = func() time.Time { return fixedNow }
+	t.Cleanup(func() {
+		nowFunc = oldNow
+	})
+
 	dir := t.TempDir()
 	t.Setenv("CODEX_HOME", dir)
+	writeJSONFile(t, filepath.Join(dir, "auth.json"), map[string]any{
+		"tokens": map[string]any{
+			"access_token": "demo-token",
+			"account_id":   "acct-demo",
+		},
+	})
+	writeJSONFile(t, filepath.Join(dir, "auth.json.demo"), map[string]any{
+		"tokens": map[string]any{
+			"access_token": "demo-token",
+			"account_id":   "acct-demo",
+		},
+	})
 
-	writeAuthFile(t, filepath.Join(dir, "auth.json"), "demo-auth")
-	writeAuthFile(t, filepath.Join(dir, "auth.json.demo"), "demo-auth")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			t.Fatalf("unexpected method: %s", r.Method)
+		}
+		if r.URL.Path != "/backend-api/wham/usage" {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer demo-token" {
+			t.Fatalf("unexpected auth header: %s", got)
+		}
+		if got := r.Header.Get("ChatGPT-Account-ID"); got != "acct-demo" {
+			t.Fatalf("unexpected account header: %s", got)
+		}
+		if got := r.Header.Get("originator"); got == "" {
+			t.Fatal("expected originator header")
+		}
+		if got := r.Header.Get("User-Agent"); got == "" {
+			t.Fatal("expected User-Agent header")
+		}
+		if got := r.Header.Get("version"); got == "" {
+			t.Fatal("expected version header")
+		}
+		writeJSONResponse(t, w, map[string]any{
+			"plan_type": "pro",
+			"rate_limit": map[string]any{
+				"primary_window": map[string]any{
+					"used_percent":         42,
+					"limit_window_seconds": 300,
+					"reset_at":             fixedNow.Add(3 * time.Minute).Unix(),
+				},
+			},
+			"credits": map[string]any{
+				"has_credits": true,
+				"unlimited":   false,
+				"balance":     "9.99",
+			},
+		})
+	}))
+	t.Cleanup(server.Close)
+	setUsageBaseURLForTest(t, server.URL+"/backend-api")
 
 	var out bytes.Buffer
 	if err := runCLI([]string{"list"}, strings.NewReader(""), &out); err != nil {
@@ -48,8 +141,23 @@ func TestRunCLIListCommandDisplaysStatus(t *testing.T) {
 	}
 
 	output := out.String()
-	if !strings.Contains(output, "Available auth files (1):") {
-		t.Fatalf("expected list output, got:\n%s", output)
+	for _, want := range []string{
+		"Available auth files (1):",
+		"Usage",
+		" * 1 demo",
+		"Pro |  58% left in     3m | Credits 9.99",
+	} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("expected list output to contain %q, got:\n%s", want, output)
+		}
+	}
+	if strings.Contains(output, "Current auth:") {
+		t.Fatalf("did not expect current auth line, got:\n%s", output)
+	}
+	for _, unwanted := range []string{"Modified", "Accessed"} {
+		if strings.Contains(output, unwanted) {
+			t.Fatalf("expected list output not to contain %q, got:\n%s", unwanted, output)
+		}
 	}
 	if strings.Contains(output, "Choose auth file by number or suffix") {
 		t.Fatalf("list command should not prompt, got:\n%s", output)
@@ -59,6 +167,7 @@ func TestRunCLIListCommandDisplaysStatus(t *testing.T) {
 func TestRunCLIUseCommandSwitchesBySuffix(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("CODEX_HOME", dir)
+	setUsageBaseURLForTest(t, "")
 
 	writeAuthFile(t, filepath.Join(dir, "auth.json"), "active-auth")
 	writeAuthFile(t, filepath.Join(dir, "auth.json.demo"), "demo-auth")
@@ -79,6 +188,7 @@ func TestRunCLIUseCommandSwitchesBySuffix(t *testing.T) {
 func TestRunCLISaveCommandSupportsForceAfterSuffix(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("CODEX_HOME", dir)
+	setUsageBaseURLForTest(t, "")
 
 	writeAuthFile(t, filepath.Join(dir, "auth.json"), "active-auth")
 	writeAuthFile(t, filepath.Join(dir, "auth.json.demo"), "old-demo")
@@ -99,6 +209,7 @@ func TestRunCLISaveCommandSupportsForceAfterSuffix(t *testing.T) {
 func TestRunCLIRefreshCommandDispatches(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("CODEX_HOME", dir)
+	setUsageBaseURLForTest(t, "")
 
 	writeJSONFile(t, filepath.Join(dir, "auth.json.demo"), map[string]any{
 		"tokens": map[string]any{
@@ -155,6 +266,8 @@ func TestRunCLILegacyFlagsFailWithMigrationGuidance(t *testing.T) {
 }
 
 func TestRunCLIRequiresSaveSuffix(t *testing.T) {
+	setUsageBaseURLForTest(t, "")
+
 	var out bytes.Buffer
 	err := runCLI([]string{"save"}, strings.NewReader(""), &out)
 	if err == nil {
@@ -166,6 +279,8 @@ func TestRunCLIRequiresSaveSuffix(t *testing.T) {
 }
 
 func TestRunCLIUnknownCommandFailsClearly(t *testing.T) {
+	setUsageBaseURLForTest(t, "")
+
 	var out bytes.Buffer
 	err := runCLI([]string{"wat"}, strings.NewReader(""), &out)
 	if err == nil {
@@ -177,6 +292,8 @@ func TestRunCLIUnknownCommandFailsClearly(t *testing.T) {
 }
 
 func TestRunCLIHelpCommandShowsSubcommandUsage(t *testing.T) {
+	setUsageBaseURLForTest(t, "")
+
 	var out bytes.Buffer
 	if err := runCLI([]string{"help", "save"}, strings.NewReader(""), &out); err != nil {
 		t.Fatalf("runCLI: %v", err)
@@ -203,4 +320,14 @@ func TestIsInteractiveReader(t *testing.T) {
 	if isInteractiveReader(file) {
 		t.Fatal("temp file should not be treated as interactive")
 	}
+}
+
+func setUsageBaseURLForTest(t *testing.T, value string) {
+	t.Helper()
+
+	previous := usageBaseURL
+	usageBaseURL = value
+	t.Cleanup(func() {
+		usageBaseURL = previous
+	})
 }

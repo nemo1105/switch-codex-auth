@@ -26,13 +26,16 @@ switch-codex-auth list
 
 The list shows how many `auth.json.*` backups are available, along with relative ages
 such as `3h ago` or `3d ago` for each file's modified time, access time (when supported
-by the filesystem), and `last_refresh` timestamp from the auth payload.
+by the filesystem), `last_refresh` timestamp from the auth payload, and a live compact
+usage summary for ChatGPT-backed aliases.
 
 Open the interactive selector:
 
 ```bash
 switch-codex-auth
 ```
+
+The interactive view shows the same live usage summaries before prompting for a selection.
 
 Switch directly to a suffix:
 
@@ -75,7 +78,8 @@ You can override the directory with `CODEX_HOME`.
 ## Behavior
 
 - Scans `auth.json.*` files and lists them by suffix.
-- Shows the number of available auth files plus relative ages for each backup's modified time, access time, and `last_refresh` when present.
+- Shows the number of available auth files, marks the current alias with `*` in the index column, and displays relative `last_refresh` time when present.
+- Fetches live usage summaries for ChatGPT-backed aliases during `list` and bare interactive mode; rows show a compact remaining-quota summary, `n/a`, or a concise status/message error when usage is unavailable.
 - Detects which backup currently matches `auth.json`.
 - Replaces `auth.json` through a temp file in the same directory before renaming it into place.
 - Supports `list`, `use`, `save`, and `refresh` as explicit subcommands.
