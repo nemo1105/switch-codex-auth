@@ -425,7 +425,7 @@ func TestRefreshPlanAliasNamesIncludesSharedTokenGroup(t *testing.T) {
 	}
 
 	got := strings.Join(refreshPlanAliasNames(plan), ",")
-	if got != "auth.json.old,auth.json.recent-shared" {
+	if got != "old,recent-shared" {
 		t.Fatalf("unexpected refresh alias names: %q", got)
 	}
 }

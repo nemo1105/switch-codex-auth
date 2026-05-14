@@ -207,7 +207,7 @@ func TestRunCLIBareCommandRefreshesStaleAliasesInBackgroundAndSyncsSelectedAuth(
 
 	output := out.String()
 	for _, want := range []string{
-		"Refreshing stale auth aliases in background: auth.json.demo",
+		"Refreshing stale auth aliases in background: demo",
 		"Switched auth to: demo",
 		"Auth refresh is still running; waiting for it to finish...",
 		"Auth refresh results:",

@@ -875,7 +875,7 @@ func refreshPlanAliasNames(plan refreshPlan) []string {
 	names := make([]string, 0, len(refreshIndexes))
 	for i, candidate := range plan.candidates {
 		if refreshIndexes[i] {
-			names = append(names, candidate.Name)
+			names = append(names, candidate.Suffix)
 		}
 	}
 	return names
