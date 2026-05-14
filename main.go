@@ -724,6 +724,14 @@ func interactiveModeWithIO(
 		return fmt.Errorf("no auth.json.* files found in %s", codexDir)
 	}
 
+	refreshTask, err := startInteractiveRefresh(codexDir, candidates)
+	if err != nil {
+		return err
+	}
+	if refreshTask != nil {
+		fmt.Fprintf(out, "Refreshing stale auth aliases in background: %s\n", strings.Join(refreshTask.aliasNames, ", "))
+	}
+
 	reader := bufio.NewReader(in)
 	defaultCandidate, hasDefault := defaultInteractiveCandidate(candidates)
 
@@ -736,6 +744,9 @@ func interactiveModeWithIO(
 
 		selection, err := reader.ReadString('\n')
 		if err != nil && !errors.Is(err, io.EOF) {
+			if refreshErr := finishInteractiveRefresh(out, refreshTask, candidate{}, false); refreshErr != nil {
+				return refreshErr
+			}
 			return fmt.Errorf("read selection: %w", err)
 		}
 
@@ -744,6 +755,9 @@ func interactiveModeWithIO(
 			if hasDefault {
 				selection = defaultCandidate.Suffix
 			} else if errors.Is(err, io.EOF) {
+				if refreshErr := finishInteractiveRefresh(out, refreshTask, candidate{}, false); refreshErr != nil {
+					return refreshErr
+				}
 				return fmt.Errorf("read selection: %w", err)
 			} else {
 				fmt.Fprintln(out, "Invalid selection: no default is available. Enter a number or suffix.")
@@ -751,7 +765,12 @@ func interactiveModeWithIO(
 			}
 		}
 
-		return switchToWithIO(codexDir, current, candidates, out, selection)
+		target, switchErr := switchToCandidateWithIO(codexDir, current, candidates, out, selection)
+		refreshErr := finishInteractiveRefresh(out, refreshTask, target, switchErr == nil)
+		if switchErr != nil {
+			return switchErr
+		}
+		return refreshErr
 	}
 }
 
@@ -760,26 +779,119 @@ func switchTo(codexDir, current string, candidates []candidate, selection string
 }
 
 func switchToWithIO(codexDir, current string, candidates []candidate, out io.Writer, selection string) error {
+	_, err := switchToCandidateWithIO(codexDir, current, candidates, out, selection)
+	return err
+}
+
+func switchToCandidateWithIO(codexDir, current string, candidates []candidate, out io.Writer, selection string) (candidate, error) {
 	if len(candidates) == 0 {
-		return fmt.Errorf("no auth.json.* files found in %s", codexDir)
+		return candidate{}, fmt.Errorf("no auth.json.* files found in %s", codexDir)
 	}
 
 	target, err := resolveTarget(candidates, selection)
 	if err != nil {
-		return err
+		return candidate{}, err
 	}
 
 	if current == target.Suffix {
 		fmt.Fprintf(out, "Already using: %s\n", target.Suffix)
-		return nil
+		return target, nil
 	}
 
 	if err := replaceAuthFile(codexDir, target.Path); err != nil {
-		return err
+		return candidate{}, err
 	}
 
 	fmt.Fprintf(out, "Switched auth to: %s\n", target.Suffix)
+	return target, nil
+}
+
+type interactiveRefreshTask struct {
+	codexDir   string
+	candidates []candidate
+	aliasNames []string
+	done       <-chan refreshReport
+}
+
+func startInteractiveRefresh(codexDir string, candidates []candidate) (*interactiveRefreshTask, error) {
+	plan, err := buildRefreshPlan(codexDir, candidates, defaultRefreshMinAgeDays)
+	if err != nil {
+		return nil, err
+	}
+	if len(plan.refreshTokens) == 0 {
+		return nil, nil
+	}
+
+	done := make(chan refreshReport, 1)
+	task := &interactiveRefreshTask{
+		codexDir:   plan.codexDir,
+		candidates: append([]candidate(nil), plan.candidates...),
+		aliasNames: refreshPlanAliasNames(plan),
+		done:       done,
+	}
+
+	go func(plan refreshPlan) {
+		executeRefreshPlan(&plan)
+		done <- completeRefreshReport(plan)
+	}(plan)
+
+	return task, nil
+}
+
+func finishInteractiveRefresh(out io.Writer, task *interactiveRefreshTask, selected candidate, hasSelected bool) error {
+	if task == nil {
+		return nil
+	}
+
+	var report refreshReport
+	select {
+	case report = <-task.done:
+	default:
+		fmt.Fprintln(out, "Auth refresh is still running; waiting for it to finish...")
+		report = <-task.done
+	}
+
+	fmt.Fprintln(out, "Auth refresh results:")
+	renderRefreshReport(out, task.candidates, report)
+
+	if hasSelected && refreshReportHasRefreshedCandidate(task.candidates, report, selected) {
+		if err := replaceAuthFile(task.codexDir, selected.Path); err != nil {
+			return fmt.Errorf("sync refreshed active auth: %w", err)
+		}
+		fmt.Fprintf(out, "Updated active auth from refreshed profile: %s\n", selected.Suffix)
+	}
+
 	return nil
+}
+
+func refreshPlanAliasNames(plan refreshPlan) []string {
+	refreshIndexes := make(map[int]bool)
+	for _, token := range plan.refreshTokens {
+		for _, index := range plan.groups[token] {
+			refreshIndexes[index] = true
+		}
+	}
+
+	names := make([]string, 0, len(refreshIndexes))
+	for i, candidate := range plan.candidates {
+		if refreshIndexes[i] {
+			names = append(names, candidate.Name)
+		}
+	}
+	return names
+}
+
+func refreshReportHasRefreshedCandidate(candidates []candidate, report refreshReport, selected candidate) bool {
+	for i, candidate := range candidates {
+		if candidate.Path != selected.Path && candidate.Suffix != selected.Suffix {
+			continue
+		}
+		if i >= len(report.Results) {
+			return false
+		}
+		return report.Results[i].Status == refreshResultRefreshed
+	}
+	return false
 }
 
 func resolveTarget(candidates []candidate, selection string) (candidate, error) {

@@ -148,6 +148,132 @@ func TestRunCLIBareCommandEnterSwitchesToDefaultCandidate(t *testing.T) {
 	}
 }
 
+func TestRunCLIBareCommandRefreshesStaleAliasesInBackgroundAndSyncsSelectedAuth(t *testing.T) {
+	fixedNow := time.Date(2026, 4, 10, 9, 0, 0, 0, time.UTC)
+	oldNow := nowFunc
+	nowFunc = func() time.Time { return fixedNow }
+	t.Cleanup(func() {
+		nowFunc = oldNow
+	})
+
+	dir := t.TempDir()
+	t.Setenv("CODEX_HOME", dir)
+	setUsageBaseURLForTest(t, "")
+
+	writeJSONFile(t, filepath.Join(dir, "auth.json"), map[string]any{
+		"tokens": map[string]any{
+			"refresh_token": "active-rt",
+		},
+	})
+	writeJSONFile(t, filepath.Join(dir, "auth.json.demo"), map[string]any{
+		"tokens": map[string]any{
+			"refresh_token": "demo-rt",
+		},
+	})
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(150 * time.Millisecond)
+
+		var req refreshRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		if req.RefreshToken != "demo-rt" {
+			t.Fatalf("unexpected refresh token: %s", req.RefreshToken)
+		}
+
+		writeJSONResponse(t, w, map[string]any{
+			"id_token":      "new-id",
+			"access_token":  "new-access",
+			"refresh_token": "new-rt",
+		})
+	}))
+	t.Cleanup(server.Close)
+	t.Setenv(refreshTokenURLOverrideEnv, server.URL)
+
+	var out bytes.Buffer
+	if err := runCLI(nil, strings.NewReader("demo\n"), &out); err != nil {
+		t.Fatalf("runCLI: %v", err)
+	}
+
+	active := readJSONFile(t, filepath.Join(dir, "auth.json"))
+	activeTokens := nestedMap(t, active, "tokens")
+	if got := activeTokens["access_token"]; got != "new-access" {
+		t.Fatalf("expected active auth to be synced after refresh, got %#v", got)
+	}
+	if got := activeTokens["refresh_token"]; got != "new-rt" {
+		t.Fatalf("expected active refresh token to be synced after refresh, got %#v", got)
+	}
+
+	output := out.String()
+	for _, want := range []string{
+		"Refreshing stale auth aliases in background: auth.json.demo",
+		"Switched auth to: demo",
+		"Auth refresh is still running; waiting for it to finish...",
+		"Auth refresh results:",
+		"[refreshed] auth.json.demo: last_refresh=<1m",
+		"Updated active auth from refreshed profile: demo",
+	} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("expected output to contain %q, got:\n%s", want, output)
+		}
+	}
+
+	switchIndex := strings.Index(output, "Switched auth to: demo")
+	waitIndex := strings.Index(output, "Auth refresh is still running; waiting for it to finish...")
+	if switchIndex < 0 || waitIndex < 0 || waitIndex < switchIndex {
+		t.Fatalf("expected switch confirmation before refresh wait message, got:\n%s", output)
+	}
+}
+
+func TestRunCLIBareCommandDoesNotStartBackgroundRefreshWithoutStaleAliases(t *testing.T) {
+	fixedNow := time.Date(2026, 4, 10, 9, 0, 0, 0, time.UTC)
+	oldNow := nowFunc
+	nowFunc = func() time.Time { return fixedNow }
+	t.Cleanup(func() {
+		nowFunc = oldNow
+	})
+
+	dir := t.TempDir()
+	t.Setenv("CODEX_HOME", dir)
+	setUsageBaseURLForTest(t, "")
+
+	writeJSONFile(t, filepath.Join(dir, "auth.json"), map[string]any{
+		"tokens": map[string]any{
+			"refresh_token": "active-rt",
+		},
+	})
+	writeJSONFile(t, filepath.Join(dir, "auth.json.demo"), map[string]any{
+		"tokens": map[string]any{
+			"access_token":  "old-access",
+			"refresh_token": "demo-rt",
+		},
+		"last_refresh": fixedNow.Add(-24 * time.Hour).Format(time.RFC3339),
+	})
+
+	var out bytes.Buffer
+	if err := runCLI(nil, strings.NewReader("demo\n"), &out); err != nil {
+		t.Fatalf("runCLI: %v", err)
+	}
+
+	output := out.String()
+	for _, unwanted := range []string{
+		"Refreshing stale auth aliases in background:",
+		"Auth refresh results:",
+		"Auth refresh is still running",
+	} {
+		if strings.Contains(output, unwanted) {
+			t.Fatalf("did not expect background refresh output %q, got:\n%s", unwanted, output)
+		}
+	}
+
+	active := readJSONFile(t, filepath.Join(dir, "auth.json"))
+	activeTokens := nestedMap(t, active, "tokens")
+	if got := activeTokens["access_token"]; got != "old-access" {
+		t.Fatalf("expected active auth to be copied without refresh, got %#v", got)
+	}
+}
+
 func TestRunCLIListCommandDisplaysStatus(t *testing.T) {
 	fixedNow := time.Date(2026, 4, 4, 12, 0, 0, 0, time.UTC)
 	oldNow := nowFunc

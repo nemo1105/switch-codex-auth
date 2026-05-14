@@ -40,6 +40,10 @@ When a profile has remaining 5-hour usage, pressing `Enter` selects the default 
 with the most 5-hour remaining usage, using 7-day remaining usage as the tie breaker.
 If every profile has 0% 5-hour remaining usage or usage is unavailable, no default is
 shown and an empty selection prompts again.
+After the list is shown, interactive mode refreshes stale aliases in the background.
+Selection remains available while refresh runs; after selection, the tool waits for any
+in-progress refresh, prints the refresh results, and syncs the active `auth.json` if the
+selected alias was refreshed.
 
 Switch directly to a suffix:
 
@@ -93,4 +97,4 @@ You can override the directory with `CODEX_HOME`.
 - Saves a new alias with `save <suffix>`, prompting before overwriting an existing `auth.json.<suffix>` in interactive terminals.
 - Supports `-f` / `--force` with `save` to overwrite an existing alias without prompting.
 - Refreshes `auth.json.*` aliases with `refresh`, defaulting to entries whose `last_refresh` is at least 7 days old or missing, and grouping identical `refresh_token` values so the same token is refreshed only once.
-- Supports number selection, suffix selection, and usage-based default selection in interactive mode.
+- Supports number selection, suffix selection, usage-based default selection, and background stale-alias refresh in interactive mode.

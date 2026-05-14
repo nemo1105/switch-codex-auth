@@ -105,15 +105,49 @@ type refreshResult struct {
 	Message string
 }
 
+type refreshPlan struct {
+	codexDir      string
+	candidates    []candidate
+	results       []refreshResult
+	documents     []*authDocument
+	groups        map[string][]int
+	refreshTokens []string
+	refreshedNow  time.Time
+}
+
+type refreshReport struct {
+	Results        []refreshResult
+	RefreshedCount int
+	SkippedCount   int
+	FailedCount    int
+}
+
 func refreshAuthAliases(w io.Writer, codexDir string, candidates []candidate, minAgeDays int) error {
-	if len(candidates) == 0 {
-		return fmt.Errorf("no auth.json.* files found in %s", codexDir)
-	}
-	if minAgeDays < 0 {
-		return fmt.Errorf("refresh days must be >= 0")
+	plan, err := buildRefreshPlan(codexDir, candidates, minAgeDays)
+	if err != nil {
+		return err
 	}
 
 	fmt.Fprintf(w, "Refreshing auth aliases in: %s\n", codexDir)
+
+	executeRefreshPlan(&plan)
+	report := completeRefreshReport(plan)
+	renderRefreshReport(w, plan.candidates, report)
+
+	if report.FailedCount != 0 {
+		return fmt.Errorf("refresh failed for %d auth file(s)", report.FailedCount)
+	}
+
+	return nil
+}
+
+func buildRefreshPlan(codexDir string, candidates []candidate, minAgeDays int) (refreshPlan, error) {
+	if len(candidates) == 0 {
+		return refreshPlan{}, fmt.Errorf("no auth.json.* files found in %s", codexDir)
+	}
+	if minAgeDays < 0 {
+		return refreshPlan{}, fmt.Errorf("refresh days must be >= 0")
+	}
 
 	results := make([]refreshResult, len(candidates))
 	documents := make([]*authDocument, len(candidates))
@@ -185,77 +219,97 @@ func refreshAuthAliases(w io.Writer, codexDir string, candidates []candidate, mi
 		}
 	}
 
-	if len(refreshTokens) != 0 {
-		cfg := defaultRefreshConfig()
-		client, err := buildHTTPClient(cfg)
-		if err != nil {
-			for _, token := range refreshTokens {
-				for _, index := range groups[token] {
-					results[index] = refreshResult{
-						Status:  refreshResultFailed,
-						Message: fmt.Sprintf("build HTTP client: %v", err),
-					}
-				}
-			}
-		} else {
-			for _, token := range refreshTokens {
-				response, err := requestChatGPTTokenRefresh(client, cfg, token)
-				if err != nil {
-					for _, index := range groups[token] {
-						results[index] = refreshResult{
-							Status:  refreshResultFailed,
-							Message: err.Error(),
-						}
-					}
-					continue
-				}
+	return refreshPlan{
+		codexDir:      codexDir,
+		candidates:    candidates,
+		results:       results,
+		documents:     documents,
+		groups:        groups,
+		refreshTokens: refreshTokens,
+		refreshedNow:  refreshedNow,
+	}, nil
+}
 
-				for _, index := range groups[token] {
-					doc := documents[index]
-					if doc == nil {
-						results[index] = refreshResult{
-							Status:  refreshResultFailed,
-							Message: "internal error: missing auth document",
-						}
-						continue
-					}
+func executeRefreshPlan(plan *refreshPlan) {
+	if plan == nil || len(plan.refreshTokens) == 0 {
+		return
+	}
 
-					if err := doc.applyRefresh(response, refreshedNow); err != nil {
-						results[index] = refreshResult{
-							Status:  refreshResultFailed,
-							Message: err.Error(),
-						}
-						continue
-					}
-
-					if err := saveAuthDocument(candidates[index].Path, *doc); err != nil {
-						results[index] = refreshResult{
-							Status:  refreshResultFailed,
-							Message: err.Error(),
-						}
-						continue
-					}
-
-					results[index] = refreshResult{
-						Status:  refreshResultRefreshed,
-						Message: fmt.Sprintf("last_refresh=%s", formatRefreshAge(refreshedNow, nowFunc().UTC())),
-					}
+	cfg := defaultRefreshConfig()
+	client, err := buildHTTPClient(cfg)
+	if err != nil {
+		for _, token := range plan.refreshTokens {
+			for _, index := range plan.groups[token] {
+				plan.results[index] = refreshResult{
+					Status:  refreshResultFailed,
+					Message: fmt.Sprintf("build HTTP client: %v", err),
 				}
 			}
 		}
+		return
 	}
+
+	for _, token := range plan.refreshTokens {
+		response, err := requestChatGPTTokenRefresh(client, cfg, token)
+		if err != nil {
+			for _, index := range plan.groups[token] {
+				plan.results[index] = refreshResult{
+					Status:  refreshResultFailed,
+					Message: err.Error(),
+				}
+			}
+			continue
+		}
+
+		for _, index := range plan.groups[token] {
+			doc := plan.documents[index]
+			if doc == nil {
+				plan.results[index] = refreshResult{
+					Status:  refreshResultFailed,
+					Message: "internal error: missing auth document",
+				}
+				continue
+			}
+
+			if err := doc.applyRefresh(response, plan.refreshedNow); err != nil {
+				plan.results[index] = refreshResult{
+					Status:  refreshResultFailed,
+					Message: err.Error(),
+				}
+				continue
+			}
+
+			if err := saveAuthDocument(plan.candidates[index].Path, *doc); err != nil {
+				plan.results[index] = refreshResult{
+					Status:  refreshResultFailed,
+					Message: err.Error(),
+				}
+				continue
+			}
+
+			plan.results[index] = refreshResult{
+				Status:  refreshResultRefreshed,
+				Message: fmt.Sprintf("last_refresh=%s", formatRefreshAge(plan.refreshedNow, nowFunc().UTC())),
+			}
+		}
+	}
+}
+
+func completeRefreshReport(plan refreshPlan) refreshReport {
+	results := append([]refreshResult(nil), plan.results...)
 
 	refreshedCount := 0
 	skippedCount := 0
 	failedCount := 0
 
-	for i, candidate := range candidates {
+	for i := range results {
 		result := results[i]
 		if result.Status == "" {
 			result = refreshResult{
 				Status:  refreshResultSkipped,
 				Message: "no refresh action taken",
 			}
+			results[i] = result
 		}
 
 		switch result.Status {
@@ -266,7 +320,19 @@ func refreshAuthAliases(w io.Writer, codexDir string, candidates []candidate, mi
 		case refreshResultFailed:
 			failedCount++
 		}
+	}
 
+	return refreshReport{
+		Results:        results,
+		RefreshedCount: refreshedCount,
+		SkippedCount:   skippedCount,
+		FailedCount:    failedCount,
+	}
+}
+
+func renderRefreshReport(w io.Writer, candidates []candidate, report refreshReport) {
+	for i, candidate := range candidates {
+		result := report.Results[i]
 		if result.Message == "" {
 			fmt.Fprintf(w, "[%s] %s\n", result.Status, candidate.Name)
 			continue
@@ -274,12 +340,7 @@ func refreshAuthAliases(w io.Writer, codexDir string, candidates []candidate, mi
 		fmt.Fprintf(w, "[%s] %s: %s\n", result.Status, candidate.Name, result.Message)
 	}
 
-	fmt.Fprintf(w, "Summary: %d refreshed, %d skipped, %d failed\n", refreshedCount, skippedCount, failedCount)
-	if failedCount != 0 {
-		return fmt.Errorf("refresh failed for %d auth file(s)", failedCount)
-	}
-
-	return nil
+	fmt.Fprintf(w, "Summary: %d refreshed, %d skipped, %d failed\n", report.RefreshedCount, report.SkippedCount, report.FailedCount)
 }
 
 func shouldRefreshAlias(lastRefresh *time.Time, now time.Time, minAgeDays int) (bool, string) {

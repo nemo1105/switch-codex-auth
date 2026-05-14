@@ -386,6 +386,50 @@ func TestInteractiveModeWithIORepromptsOnEmptyInputWithoutDefault(t *testing.T) 
 	}
 }
 
+func TestRefreshPlanAliasNamesIncludesSharedTokenGroup(t *testing.T) {
+	fixedNow := time.Date(2026, 4, 10, 9, 0, 0, 0, time.UTC)
+	oldNow := nowFunc
+	nowFunc = func() time.Time { return fixedNow }
+	t.Cleanup(func() {
+		nowFunc = oldNow
+	})
+
+	dir := t.TempDir()
+	writeJSONFile(t, filepath.Join(dir, "auth.json.old"), map[string]any{
+		"tokens": map[string]any{
+			"refresh_token": "shared-rt",
+		},
+		"last_refresh": fixedNow.Add(-8 * 24 * time.Hour).Format(time.RFC3339),
+	})
+	writeJSONFile(t, filepath.Join(dir, "auth.json.recent-shared"), map[string]any{
+		"tokens": map[string]any{
+			"refresh_token": "shared-rt",
+		},
+		"last_refresh": fixedNow.Add(-24 * time.Hour).Format(time.RFC3339),
+	})
+	writeJSONFile(t, filepath.Join(dir, "auth.json.recent-solo"), map[string]any{
+		"tokens": map[string]any{
+			"refresh_token": "recent-rt",
+		},
+		"last_refresh": fixedNow.Add(-24 * time.Hour).Format(time.RFC3339),
+	})
+
+	candidates, err := loadCandidates(dir)
+	if err != nil {
+		t.Fatalf("loadCandidates: %v", err)
+	}
+
+	plan, err := buildRefreshPlan(dir, candidates, defaultRefreshMinAgeDays)
+	if err != nil {
+		t.Fatalf("buildRefreshPlan: %v", err)
+	}
+
+	got := strings.Join(refreshPlanAliasNames(plan), ",")
+	if got != "auth.json.old,auth.json.recent-shared" {
+		t.Fatalf("unexpected refresh alias names: %q", got)
+	}
+}
+
 func TestSaveCurrentAsWithIOSavesNewAlias(t *testing.T) {
 	dir := t.TempDir()
 	writeAuthFile(t, filepath.Join(dir, "auth.json"), "active")
