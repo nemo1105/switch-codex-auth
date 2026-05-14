@@ -85,6 +85,70 @@ func TestFormatUsageSummaryOmitsNoneCredits(t *testing.T) {
 	}
 }
 
+func TestUsageRemainingMetricsFromSnapshots(t *testing.T) {
+	metrics := usageRemainingMetricsFromSnapshots([]accountRateLimitSnapshot{
+		{
+			LimitID: "codex",
+			Primary: &accountRateLimitWindow{
+				UsedPercent:        25,
+				WindowDurationMins: int64Ptr(fiveHourUsageWindowMins),
+			},
+			Secondary: &accountRateLimitWindow{
+				UsedPercent:        60,
+				WindowDurationMins: int64Ptr(sevenDayUsageWindowMins),
+			},
+		},
+	})
+
+	if !metrics.HasFiveHourRemaining || metrics.FiveHourRemaining != 75 {
+		t.Fatalf("unexpected five hour remaining metrics: %#v", metrics)
+	}
+	if !metrics.HasSevenDayRemaining || metrics.SevenDayRemaining != 40 {
+		t.Fatalf("unexpected seven day remaining metrics: %#v", metrics)
+	}
+}
+
+func TestUsageRemainingMetricsIgnoreMismatchedWindows(t *testing.T) {
+	metrics := usageRemainingMetricsFromSnapshots([]accountRateLimitSnapshot{
+		{
+			LimitID: "codex",
+			Primary: &accountRateLimitWindow{
+				UsedPercent:        25,
+				WindowDurationMins: int64Ptr(15),
+			},
+			Secondary: &accountRateLimitWindow{
+				UsedPercent:        60,
+				WindowDurationMins: int64Ptr(60),
+			},
+		},
+	})
+
+	if metrics.HasFiveHourRemaining || metrics.HasSevenDayRemaining {
+		t.Fatalf("expected mismatched windows to be ignored: %#v", metrics)
+	}
+}
+
+func TestUsageRemainingMetricsAcceptMissingWindowDurations(t *testing.T) {
+	metrics := usageRemainingMetricsFromSnapshots([]accountRateLimitSnapshot{
+		{
+			LimitID: "codex",
+			Primary: &accountRateLimitWindow{
+				UsedPercent: 30,
+			},
+			Secondary: &accountRateLimitWindow{
+				UsedPercent: 80,
+			},
+		},
+	})
+
+	if !metrics.HasFiveHourRemaining || metrics.FiveHourRemaining != 70 {
+		t.Fatalf("unexpected five hour remaining metrics: %#v", metrics)
+	}
+	if !metrics.HasSevenDayRemaining || metrics.SevenDayRemaining != 20 {
+		t.Fatalf("unexpected seven day remaining metrics: %#v", metrics)
+	}
+}
+
 func TestFormatUsageErrorTimeout(t *testing.T) {
 	err := fmt.Errorf("perform usage request: %w", context.DeadlineExceeded)
 	if got := formatUsageError(err); got != "Request timeout" {

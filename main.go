@@ -17,11 +17,19 @@ import (
 )
 
 type candidate struct {
-	Name     string
-	Suffix   string
-	Path     string
-	Metadata authMetadata
-	Usage    string
+	Name           string
+	Suffix         string
+	Path           string
+	Metadata       authMetadata
+	Usage          string
+	UsageRemaining usageRemainingMetrics
+}
+
+type usageRemainingMetrics struct {
+	FiveHourRemaining    float64
+	HasFiveHourRemaining bool
+	SevenDayRemaining    float64
+	HasSevenDayRemaining bool
 }
 
 type authMetadata struct {
@@ -716,20 +724,35 @@ func interactiveModeWithIO(
 		return fmt.Errorf("no auth.json.* files found in %s", codexDir)
 	}
 
-	fmt.Fprint(out, "Choose auth file by number or suffix (Enter to cancel): ")
 	reader := bufio.NewReader(in)
-	selection, err := reader.ReadString('\n')
-	if err != nil && !errors.Is(err, io.EOF) {
-		return fmt.Errorf("read selection: %w", err)
-	}
+	defaultCandidate, hasDefault := defaultInteractiveCandidate(candidates)
 
-	selection = strings.TrimSpace(selection)
-	if selection == "" {
-		fmt.Fprintln(out, "Cancelled.")
-		return nil
-	}
+	for {
+		if hasDefault {
+			fmt.Fprintf(out, "Choose auth file by number or suffix [default: %s]: ", defaultCandidate.Suffix)
+		} else {
+			fmt.Fprint(out, "Choose auth file by number or suffix: ")
+		}
 
-	return switchToWithIO(codexDir, current, candidates, out, selection)
+		selection, err := reader.ReadString('\n')
+		if err != nil && !errors.Is(err, io.EOF) {
+			return fmt.Errorf("read selection: %w", err)
+		}
+
+		selection = strings.TrimSpace(selection)
+		if selection == "" {
+			if hasDefault {
+				selection = defaultCandidate.Suffix
+			} else if errors.Is(err, io.EOF) {
+				return fmt.Errorf("read selection: %w", err)
+			} else {
+				fmt.Fprintln(out, "Invalid selection: no default is available. Enter a number or suffix.")
+				continue
+			}
+		}
+
+		return switchToWithIO(codexDir, current, candidates, out, selection)
+	}
 }
 
 func switchTo(codexDir, current string, candidates []candidate, selection string) error {
@@ -775,6 +798,35 @@ func resolveTarget(candidates []candidate, selection string) (candidate, error) 
 	}
 
 	return candidate{}, fmt.Errorf("unknown auth target: %s", selection)
+}
+
+func defaultInteractiveCandidate(candidates []candidate) (candidate, bool) {
+	var best candidate
+	hasBest := false
+
+	for _, candidate := range candidates {
+		usage := candidate.UsageRemaining
+		if !usage.HasFiveHourRemaining || usage.FiveHourRemaining <= 0 {
+			continue
+		}
+
+		if !hasBest ||
+			usage.FiveHourRemaining > best.UsageRemaining.FiveHourRemaining ||
+			(usage.FiveHourRemaining == best.UsageRemaining.FiveHourRemaining &&
+				sevenDayRemainingForDefault(usage) > sevenDayRemainingForDefault(best.UsageRemaining)) {
+			best = candidate
+			hasBest = true
+		}
+	}
+
+	return best, hasBest
+}
+
+func sevenDayRemainingForDefault(usage usageRemainingMetrics) float64 {
+	if !usage.HasSevenDayRemaining {
+		return 0
+	}
+	return usage.SevenDayRemaining
 }
 
 func normalizeSelection(selection string) string {

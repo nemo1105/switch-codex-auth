@@ -279,6 +279,113 @@ func TestFormatDisplayTimeFallback(t *testing.T) {
 	}
 }
 
+func TestDefaultInteractiveCandidate(t *testing.T) {
+	metrics := func(hasFive bool, five float64, hasSeven bool, seven float64) usageRemainingMetrics {
+		return usageRemainingMetrics{
+			FiveHourRemaining:    five,
+			HasFiveHourRemaining: hasFive,
+			SevenDayRemaining:    seven,
+			HasSevenDayRemaining: hasSeven,
+		}
+	}
+
+	tests := []struct {
+		name       string
+		candidates []candidate
+		wantSuffix string
+		wantOK     bool
+	}{
+		{
+			name: "chooses highest five hour remaining",
+			candidates: []candidate{
+				{Suffix: "alpha", UsageRemaining: metrics(true, 40, true, 100)},
+				{Suffix: "beta", UsageRemaining: metrics(true, 80, true, 10)},
+			},
+			wantSuffix: "beta",
+			wantOK:     true,
+		},
+		{
+			name: "uses seven day remaining as tie breaker",
+			candidates: []candidate{
+				{Suffix: "alpha", UsageRemaining: metrics(true, 80, true, 20)},
+				{Suffix: "beta", UsageRemaining: metrics(true, 80, true, 70)},
+			},
+			wantSuffix: "beta",
+			wantOK:     true,
+		},
+		{
+			name: "keeps display order after full tie",
+			candidates: []candidate{
+				{Suffix: "alpha", UsageRemaining: metrics(true, 80, true, 70)},
+				{Suffix: "beta", UsageRemaining: metrics(true, 80, true, 70)},
+			},
+			wantSuffix: "alpha",
+			wantOK:     true,
+		},
+		{
+			name: "does not choose default when all five hour remaining is zero",
+			candidates: []candidate{
+				{Suffix: "alpha", UsageRemaining: metrics(true, 0, true, 100)},
+				{Suffix: "beta", UsageRemaining: metrics(true, 0, true, 50)},
+			},
+		},
+		{
+			name: "does not choose default without five hour data",
+			candidates: []candidate{
+				{Suffix: "alpha", Usage: "n/a"},
+				{Suffix: "beta", Usage: "401: expired", UsageRemaining: metrics(false, 0, true, 100)},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := defaultInteractiveCandidate(tt.candidates)
+			if ok != tt.wantOK {
+				t.Fatalf("unexpected ok: got %v want %v", ok, tt.wantOK)
+			}
+			if ok && got.Suffix != tt.wantSuffix {
+				t.Fatalf("unexpected default suffix: got %q want %q", got.Suffix, tt.wantSuffix)
+			}
+		})
+	}
+}
+
+func TestInteractiveModeWithIORepromptsOnEmptyInputWithoutDefault(t *testing.T) {
+	dir := t.TempDir()
+	writeAuthFile(t, filepath.Join(dir, "auth.json"), "active")
+	targetPath := filepath.Join(dir, "auth.json.demo")
+	writeAuthFile(t, targetPath, "demo-auth")
+
+	var out bytes.Buffer
+	err := interactiveModeWithIO(
+		dir,
+		"none",
+		nil,
+		[]candidate{{Suffix: "demo", Path: targetPath}},
+		strings.NewReader("\ndemo\n"),
+		&out,
+	)
+	if err != nil {
+		t.Fatalf("interactiveModeWithIO: %v", err)
+	}
+
+	if got := readAuthFile(t, filepath.Join(dir, "auth.json")); got != "demo-auth" {
+		t.Fatalf("expected switch after reprompt, got %q", got)
+	}
+
+	output := out.String()
+	if !strings.Contains(output, "Invalid selection: no default is available. Enter a number or suffix.") {
+		t.Fatalf("expected invalid empty-input message, got:\n%s", output)
+	}
+	if strings.Count(output, "Choose auth file by number or suffix: ") != 2 {
+		t.Fatalf("expected two prompts, got:\n%s", output)
+	}
+	if !strings.Contains(output, "Switched auth to: demo") {
+		t.Fatalf("expected switch confirmation, got:\n%s", output)
+	}
+}
+
 func TestSaveCurrentAsWithIOSavesNewAlias(t *testing.T) {
 	dir := t.TempDir()
 	writeAuthFile(t, filepath.Join(dir, "auth.json"), "active")

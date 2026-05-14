@@ -22,6 +22,8 @@ const (
 	usageRequestStagger        = 50 * time.Millisecond
 	usagePercentWidth          = 4
 	usageDurationWidth         = 6
+	fiveHourUsageWindowMins    = int64(5 * 60)
+	sevenDayUsageWindowMins    = int64(7 * 24 * 60)
 )
 
 var usageBaseURL = defaultUsageBaseURL
@@ -184,8 +186,9 @@ func enrichCandidatesWithUsage(candidates []candidate) []candidate {
 	}
 
 	type usageRequestResult struct {
-		key     string
-		summary string
+		key             string
+		summary         string
+		remainingMetric usageRemainingMetrics
 	}
 
 	results := make(chan usageRequestResult, len(requestOrder))
@@ -204,12 +207,15 @@ func enrichCandidatesWithUsage(candidates []candidate) []candidate {
 
 			snapshots, err := requestAccountUsage(client, requestGroups[key].auth)
 			summary := formatUsageError(err)
+			var remainingMetric usageRemainingMetrics
 			if err == nil {
 				summary = formatUsageSummary(snapshots)
+				remainingMetric = usageRemainingMetricsFromSnapshots(snapshots)
 			}
 			results <- usageRequestResult{
-				key:     key,
-				summary: summary,
+				key:             key,
+				summary:         summary,
+				remainingMetric: remainingMetric,
 			}
 		}(i, key)
 	}
@@ -220,6 +226,7 @@ func enrichCandidatesWithUsage(candidates []candidate) []candidate {
 	for result := range results {
 		for _, index := range requestGroups[result.key].indexes {
 			enriched[index].Usage = result.summary
+			enriched[index].UsageRemaining = result.remainingMetric
 		}
 	}
 
@@ -478,6 +485,31 @@ func formatUsageSummary(snapshots []accountRateLimitSnapshot) string {
 		return "n/a"
 	}
 	return strings.Join(parts, " | ")
+}
+
+func usageRemainingMetricsFromSnapshots(snapshots []accountRateLimitSnapshot) usageRemainingMetrics {
+	var metrics usageRemainingMetrics
+	if len(snapshots) == 0 {
+		return metrics
+	}
+
+	primary := snapshots[0]
+	if usageWindowMatchesDefaultDuration(primary.Primary, fiveHourUsageWindowMins) {
+		metrics.FiveHourRemaining = remainingUsagePercent(primary.Primary.UsedPercent)
+		metrics.HasFiveHourRemaining = true
+	}
+	if usageWindowMatchesDefaultDuration(primary.Secondary, sevenDayUsageWindowMins) {
+		metrics.SevenDayRemaining = remainingUsagePercent(primary.Secondary.UsedPercent)
+		metrics.HasSevenDayRemaining = true
+	}
+	return metrics
+}
+
+func usageWindowMatchesDefaultDuration(window *accountRateLimitWindow, minutes int64) bool {
+	if window == nil {
+		return false
+	}
+	return window.WindowDurationMins == nil || *window.WindowDurationMins == minutes
 }
 
 func countAdditionalRateLimits(snapshots []accountRateLimitSnapshot) int {

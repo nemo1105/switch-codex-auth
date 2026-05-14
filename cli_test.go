@@ -41,7 +41,7 @@ func TestRunCLIBareCommandUsesInteractiveMode(t *testing.T) {
 			"rate_limit": map[string]any{
 				"primary_window": map[string]any{
 					"used_percent":         25,
-					"limit_window_seconds": 900,
+					"limit_window_seconds": int64(5 * time.Hour / time.Second),
 					"reset_at":             fixedNow.Add(3 * time.Minute).Unix(),
 				},
 			},
@@ -65,11 +65,86 @@ func TestRunCLIBareCommandUsesInteractiveMode(t *testing.T) {
 	if !strings.Contains(output, "Plus |  75% left in     3m") {
 		t.Fatalf("expected usage summary in output, got:\n%s", output)
 	}
-	if !strings.Contains(output, "Choose auth file by number or suffix (Enter to cancel): ") {
+	if !strings.Contains(output, "Choose auth file by number or suffix [default: demo]: ") {
 		t.Fatalf("expected interactive prompt, got:\n%s", output)
 	}
-	if !strings.Contains(output, "Cancelled.") {
-		t.Fatalf("expected cancel message, got:\n%s", output)
+	if !strings.Contains(output, "Already using: demo") {
+		t.Fatalf("expected empty input to select the default profile, got:\n%s", output)
+	}
+}
+
+func TestRunCLIBareCommandEnterSwitchesToDefaultCandidate(t *testing.T) {
+	fixedNow := time.Date(2026, 4, 4, 12, 0, 0, 0, time.UTC)
+	oldNow := nowFunc
+	nowFunc = func() time.Time { return fixedNow }
+	t.Cleanup(func() {
+		nowFunc = oldNow
+	})
+
+	dir := t.TempDir()
+	t.Setenv("CODEX_HOME", dir)
+	writeJSONFile(t, filepath.Join(dir, "auth.json"), map[string]any{
+		"tokens": map[string]any{
+			"id_token":     testJWT(t, map[string]any{"email": "active@example.com"}),
+			"access_token": "active-token",
+		},
+	})
+	bestBytes := writeJSONFile(t, filepath.Join(dir, "auth.json.best"), map[string]any{
+		"tokens": map[string]any{
+			"id_token":     testJWT(t, map[string]any{"email": "best@example.com"}),
+			"access_token": "best-token",
+		},
+	})
+	writeJSONFile(t, filepath.Join(dir, "auth.json.low"), map[string]any{
+		"tokens": map[string]any{
+			"id_token":     testJWT(t, map[string]any{"email": "low@example.com"}),
+			"access_token": "low-token",
+		},
+	})
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		usedPercent := 60.0
+		if strings.TrimSpace(r.Header.Get("Authorization")) == "Bearer best-token" {
+			usedPercent = 20
+		}
+		writeJSONResponse(t, w, map[string]any{
+			"plan_type": "pro",
+			"rate_limit": map[string]any{
+				"primary_window": map[string]any{
+					"used_percent":         usedPercent,
+					"limit_window_seconds": int64(5 * time.Hour / time.Second),
+					"reset_at":             fixedNow.Add(2 * time.Hour).Unix(),
+				},
+				"secondary_window": map[string]any{
+					"used_percent":         10,
+					"limit_window_seconds": int64(7 * 24 * time.Hour / time.Second),
+					"reset_at":             fixedNow.Add(6 * 24 * time.Hour).Unix(),
+				},
+			},
+		})
+	}))
+	t.Cleanup(server.Close)
+	setUsageBaseURLForTest(t, server.URL+"/backend-api")
+
+	var out bytes.Buffer
+	if err := runCLI(nil, strings.NewReader("\n"), &out); err != nil {
+		t.Fatalf("runCLI: %v", err)
+	}
+
+	activeBytes, err := os.ReadFile(filepath.Join(dir, "auth.json"))
+	if err != nil {
+		t.Fatalf("read active auth: %v", err)
+	}
+	if !bytes.Equal(activeBytes, bestBytes) {
+		t.Fatalf("empty input should switch to best default profile\n got: %s\nwant: %s", activeBytes, bestBytes)
+	}
+
+	output := out.String()
+	if !strings.Contains(output, "Choose auth file by number or suffix [default: best]: ") {
+		t.Fatalf("expected best default prompt, got:\n%s", output)
+	}
+	if !strings.Contains(output, "Switched auth to: best") {
+		t.Fatalf("expected switch confirmation, got:\n%s", output)
 	}
 }
 
