@@ -133,12 +133,12 @@ func runSaveSubcommand(args []string, in io.Reader, out io.Writer, prog string) 
 }
 
 func runRefreshSubcommand(args []string, out io.Writer, prog string) error {
-	days, handled, err := parseRefreshSubcommandArgs(args, out, prog)
+	options, handled, err := parseRefreshSubcommandArgs(args, out, prog)
 	if handled || err != nil {
 		return err
 	}
 
-	return runRefreshCommand(out, days)
+	return runRefreshCommand(out, options)
 }
 
 func runInteractiveCommand(in io.Reader, out io.Writer) error {
@@ -178,7 +178,7 @@ func runSaveCommand(selection string, force bool, in io.Reader, out io.Writer) e
 	return saveCurrentAsWithIO(codexDir, selection, force, in, out, isInteractiveReader(in))
 }
 
-func runRefreshCommand(out io.Writer, days int) error {
+func runRefreshCommand(out io.Writer, options refreshOptions) error {
 	codexDir, err := codexHome()
 	if err != nil {
 		return err
@@ -189,7 +189,7 @@ func runRefreshCommand(out io.Writer, days int) error {
 		return err
 	}
 
-	return refreshAuthAliases(out, codexDir, candidates, days)
+	return refreshAuthAliases(out, codexDir, candidates, options)
 }
 
 func parseNoArgSubcommand(
@@ -264,28 +264,30 @@ func parseSaveSubcommandArgs(args []string, out io.Writer, prog string) (string,
 	}
 }
 
-func parseRefreshSubcommandArgs(args []string, out io.Writer, prog string) (int, bool, error) {
+func parseRefreshSubcommandArgs(args []string, out io.Writer, prog string) (refreshOptions, bool, error) {
 	flagSet := flag.NewFlagSet("refresh", flag.ContinueOnError)
 	flagSet.SetOutput(io.Discard)
 
-	days := defaultRefreshMinAgeDays
-	flagSet.IntVar(&days, "days", defaultRefreshMinAgeDays, "minimum age in days since last_refresh")
+	options := defaultRefreshOptions()
+	flagSet.IntVar(&options.MinAgeDays, "days", defaultRefreshMinAgeDays, "minimum age in days since last_refresh")
+	flagSet.BoolVar(&options.Force, "f", false, "refresh all refreshable auth aliases without last_refresh checks")
+	flagSet.BoolVar(&options.Force, "force", false, "refresh all refreshable auth aliases without last_refresh checks")
 
 	if err := flagSet.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			writeRefreshUsage(out, prog)
-			return 0, true, nil
+			return refreshOptions{}, true, nil
 		}
-		return 0, false, fmt.Errorf("%v (run `%s help refresh` for usage)", err, prog)
+		return refreshOptions{}, false, fmt.Errorf("%v (run `%s help refresh` for usage)", err, prog)
 	}
 	if flagSet.NArg() != 0 {
-		return 0, false, fmt.Errorf("refresh does not accept arguments (usage: %s refresh [--days N])", prog)
+		return refreshOptions{}, false, fmt.Errorf("refresh does not accept arguments (usage: %s refresh [-f|--force] [--days N])", prog)
 	}
-	if days < 0 {
-		return 0, false, fmt.Errorf("refresh days must be >= 0 (usage: %s refresh [--days N])", prog)
+	if options.MinAgeDays < 0 {
+		return refreshOptions{}, false, fmt.Errorf("refresh days must be >= 0 (usage: %s refresh [-f|--force] [--days N])", prog)
 	}
 
-	return days, false, nil
+	return options, false, nil
 }
 
 func normalizeSaveArgs(args []string) []string {
@@ -332,13 +334,13 @@ func writeRootUsage(w io.Writer, prog string) {
 	fmt.Fprintf(w, "  %s list\n", prog)
 	fmt.Fprintf(w, "  %s use <suffix-or-index>\n", prog)
 	fmt.Fprintf(w, "  %s save <suffix> [-f|--force]\n", prog)
-	fmt.Fprintf(w, "  %s refresh [--days N]\n", prog)
+	fmt.Fprintf(w, "  %s refresh [-f|--force] [--days N]\n", prog)
 	fmt.Fprintf(w, "  %s help [command]\n", prog)
 	fmt.Fprintf(w, "\nCommands:\n")
 	fmt.Fprintf(w, "  list     Show the current auth, auth.json.* files, and live usage summaries\n")
 	fmt.Fprintf(w, "  use      Switch to auth.json.<suffix> or a menu index\n")
 	fmt.Fprintf(w, "  save     Copy the current auth.json to auth.json.<suffix>\n")
-	fmt.Fprintf(w, "  refresh  Refresh auth.json.* files whose last_refresh is at least N days old (default 7)\n")
+	fmt.Fprintf(w, "  refresh  Refresh auth.json.* files whose last_refresh is at least N days old unless forced (default 7)\n")
 	fmt.Fprintf(w, "\nEnvironment:\n")
 	fmt.Fprintf(w, "  CODEX_HOME  Override the auth directory. Defaults to %s\n", defaultCodexHomeHint())
 }
@@ -360,7 +362,7 @@ func writeSaveUsage(w io.Writer, prog string) {
 
 func writeRefreshUsage(w io.Writer, prog string) {
 	fmt.Fprintf(w, "Usage:\n")
-	fmt.Fprintf(w, "  %s refresh [--days N]\n", prog)
+	fmt.Fprintf(w, "  %s refresh [-f|--force] [--days N]\n", prog)
 }
 
 func loadInteractiveState() (string, []candidate, string, *authMetadata, error) {
@@ -814,7 +816,7 @@ type interactiveRefreshTask struct {
 }
 
 func startInteractiveRefresh(codexDir string, candidates []candidate) (*interactiveRefreshTask, error) {
-	plan, err := buildRefreshPlan(codexDir, candidates, defaultRefreshMinAgeDays)
+	plan, err := buildRefreshPlan(codexDir, candidates, defaultRefreshOptions())
 	if err != nil {
 		return nil, err
 	}

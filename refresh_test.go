@@ -118,7 +118,7 @@ func TestRefreshAuthAliasesRefreshesGroupsSkipsFailuresAndLeavesActiveAuthUnchan
 	}
 
 	var out bytes.Buffer
-	err = refreshAuthAliases(&out, dir, candidates, defaultRefreshMinAgeDays)
+	err = refreshAuthAliases(&out, dir, candidates, defaultRefreshOptions())
 	if err == nil {
 		t.Fatal("expected aggregate refresh error")
 	}
@@ -227,7 +227,7 @@ func TestRefreshAuthAliasesClassifiesPermanent401Failures(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	err = refreshAuthAliases(&out, dir, candidates, defaultRefreshMinAgeDays)
+	err = refreshAuthAliases(&out, dir, candidates, defaultRefreshOptions())
 	if err == nil {
 		t.Fatal("expected refresh failure")
 	}
@@ -328,7 +328,7 @@ func TestRefreshAuthAliasesHonorsLastRefreshThresholdAndSharedTokenGroups(t *tes
 	}
 
 	var out bytes.Buffer
-	if err := refreshAuthAliases(&out, dir, candidates, defaultRefreshMinAgeDays); err != nil {
+	if err := refreshAuthAliases(&out, dir, candidates, defaultRefreshOptions()); err != nil {
 		t.Fatalf("refreshAuthAliases: %v", err)
 	}
 
@@ -417,7 +417,7 @@ func TestRefreshAuthAliasesReportsWriteFailures(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	err = refreshAuthAliases(&out, dir, candidates, defaultRefreshMinAgeDays)
+	err = refreshAuthAliases(&out, dir, candidates, defaultRefreshOptions())
 	if err == nil {
 		t.Fatal("expected write failure")
 	}

@@ -419,7 +419,7 @@ func TestRefreshPlanAliasNamesIncludesSharedTokenGroup(t *testing.T) {
 		t.Fatalf("loadCandidates: %v", err)
 	}
 
-	plan, err := buildRefreshPlan(dir, candidates, defaultRefreshMinAgeDays)
+	plan, err := buildRefreshPlan(dir, candidates, defaultRefreshOptions())
 	if err != nil {
 		t.Fatalf("buildRefreshPlan: %v", err)
 	}
@@ -427,6 +427,18 @@ func TestRefreshPlanAliasNamesIncludesSharedTokenGroup(t *testing.T) {
 	got := strings.Join(refreshPlanAliasNames(plan), ",")
 	if got != "old,recent-shared" {
 		t.Fatalf("unexpected refresh alias names: %q", got)
+	}
+
+	forceOptions := defaultRefreshOptions()
+	forceOptions.Force = true
+	forcePlan, err := buildRefreshPlan(dir, candidates, forceOptions)
+	if err != nil {
+		t.Fatalf("buildRefreshPlan force: %v", err)
+	}
+
+	forceGot := strings.Join(refreshPlanAliasNames(forcePlan), ",")
+	if forceGot != "old,recent-shared,recent-solo" {
+		t.Fatalf("unexpected force refresh alias names: %q", forceGot)
 	}
 }
 

@@ -74,6 +74,11 @@ type refreshConfig struct {
 	Timeout         time.Duration
 }
 
+type refreshOptions struct {
+	MinAgeDays int
+	Force      bool
+}
+
 type refreshTokenFailedReason string
 
 const (
@@ -122,8 +127,14 @@ type refreshReport struct {
 	FailedCount    int
 }
 
-func refreshAuthAliases(w io.Writer, codexDir string, candidates []candidate, minAgeDays int) error {
-	plan, err := buildRefreshPlan(codexDir, candidates, minAgeDays)
+func defaultRefreshOptions() refreshOptions {
+	return refreshOptions{
+		MinAgeDays: defaultRefreshMinAgeDays,
+	}
+}
+
+func refreshAuthAliases(w io.Writer, codexDir string, candidates []candidate, options refreshOptions) error {
+	plan, err := buildRefreshPlan(codexDir, candidates, options)
 	if err != nil {
 		return err
 	}
@@ -141,11 +152,11 @@ func refreshAuthAliases(w io.Writer, codexDir string, candidates []candidate, mi
 	return nil
 }
 
-func buildRefreshPlan(codexDir string, candidates []candidate, minAgeDays int) (refreshPlan, error) {
+func buildRefreshPlan(codexDir string, candidates []candidate, options refreshOptions) (refreshPlan, error) {
 	if len(candidates) == 0 {
 		return refreshPlan{}, fmt.Errorf("no auth.json.* files found in %s", codexDir)
 	}
-	if minAgeDays < 0 {
+	if options.MinAgeDays < 0 {
 		return refreshPlan{}, fmt.Errorf("refresh days must be >= 0")
 	}
 
@@ -194,7 +205,10 @@ func buildRefreshPlan(codexDir string, candidates []candidate, minAgeDays int) (
 		}
 
 		documents[i] = &doc
-		shouldRefresh, skipReason := shouldRefreshAlias(doc.parsed.LastRefresh, refreshedNow, minAgeDays)
+		shouldRefresh, skipReason := true, ""
+		if !options.Force {
+			shouldRefresh, skipReason = shouldRefreshAlias(doc.parsed.LastRefresh, refreshedNow, options.MinAgeDays)
+		}
 		skipReasons[i] = skipReason
 		if _, ok := groups[refreshToken]; !ok {
 			tokenOrder = append(tokenOrder, refreshToken)
