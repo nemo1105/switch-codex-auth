@@ -69,7 +69,7 @@ func TestPrintStatus(t *testing.T) {
 				"Hint:",
 				"  * marks the current alias",
 				"  Last refresh is a local file signal",
-				"  Usage is live account data and may show n/a or a concise error per alias",
+				"  Usage is shown only with --usage api|chat and may show n/a or a concise error per alias",
 			},
 			wantMissing: []string{
 				"Current auth:",

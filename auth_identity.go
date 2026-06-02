@@ -9,7 +9,11 @@ import (
 )
 
 type idTokenClaims struct {
-	Email   string `json:"email"`
+	Email           string `json:"email"`
+	ChatGPTPlanType string `json:"chatgpt_plan_type"`
+	Auth            *struct {
+		ChatGPTPlanType string `json:"chatgpt_plan_type"`
+	} `json:"https://api.openai.com/auth"`
 	Profile *struct {
 		Email string `json:"email"`
 	} `json:"https://api.openai.com/profile"`

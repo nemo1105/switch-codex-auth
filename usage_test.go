@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -149,6 +150,29 @@ func TestUsageRemainingMetricsAcceptMissingWindowDurations(t *testing.T) {
 	}
 }
 
+func TestMapRateLimitHeaderWindowIgnoresZeroOnlyWindow(t *testing.T) {
+	headers := make(http.Header)
+	headers.Set("x-codex-primary-used-percent", "0")
+
+	if got := mapRateLimitHeaderWindow(headers, "x-codex-primary"); got != nil {
+		t.Fatalf("expected zero-only header window to be ignored, got %#v", got)
+	}
+
+	headers.Set("x-codex-primary-window-minutes", "0")
+	if got := mapRateLimitHeaderWindow(headers, "x-codex-primary"); got != nil {
+		t.Fatalf("expected zero duration header window to be ignored, got %#v", got)
+	}
+
+	headers.Set("x-codex-primary-window-minutes", fmt.Sprint(fiveHourUsageWindowMins))
+	got := mapRateLimitHeaderWindow(headers, "x-codex-primary")
+	if got == nil {
+		t.Fatal("expected duration-bearing zero usage window")
+	}
+	if got.UsedPercent != 0 || got.WindowDurationMins == nil || *got.WindowDurationMins != fiveHourUsageWindowMins {
+		t.Fatalf("unexpected duration-bearing zero usage window: %#v", got)
+	}
+}
+
 func TestFormatUsageErrorTimeout(t *testing.T) {
 	err := fmt.Errorf("perform usage request: %w", context.DeadlineExceeded)
 	if got := formatUsageError(err); got != "Request timeout" {
@@ -191,6 +215,53 @@ func TestDecodeAccountUsagePayloadNormalizesPlanAndExtras(t *testing.T) {
 	}
 }
 
+func TestExtractPlanTypeFromAuthReadsNestedAuthClaim(t *testing.T) {
+	auth := authPayload{
+		Tokens: &tokenData{
+			IDToken: testJWT(t, map[string]any{
+				"https://api.openai.com/auth": map[string]any{
+					"chatgpt_plan_type": "plus",
+				},
+			}),
+		},
+	}
+
+	if got := extractPlanTypeFromAuth(auth); got != accountPlanTypePlus {
+		t.Fatalf("unexpected plan type: %q", got)
+	}
+}
+
+func TestEnrichCandidatesWithUsageNoneDoesNotRequest(t *testing.T) {
+	dir := t.TempDir()
+	writeJSONFile(t, filepath.Join(dir, "auth.json.demo"), map[string]any{
+		"tokens": map[string]any{
+			"id_token":     testJWT(t, map[string]any{"chatgpt_plan_type": "pro"}),
+			"access_token": "demo-token",
+		},
+	})
+
+	called := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		t.Fatalf("usage request should not be sent in none mode")
+	}))
+	t.Cleanup(server.Close)
+	setUsageBaseURLForTest(t, server.URL+"/backend-api")
+
+	candidates, err := loadCandidates(dir)
+	if err != nil {
+		t.Fatalf("loadCandidates: %v", err)
+	}
+
+	enriched := enrichCandidatesWithUsage(candidates, usageModeNone)
+	if called {
+		t.Fatal("usage request was sent")
+	}
+	if got := enriched[0].Usage; got != "" {
+		t.Fatalf("none mode should leave usage empty, got %q", got)
+	}
+}
+
 func TestEnrichCandidatesWithUsageDeduplicatesAndHandlesErrors(t *testing.T) {
 	fixedNow := time.Date(2026, 4, 4, 12, 0, 0, 0, time.UTC)
 	oldNow := nowFunc
@@ -203,12 +274,14 @@ func TestEnrichCandidatesWithUsageDeduplicatesAndHandlesErrors(t *testing.T) {
 
 	writeJSONFile(t, filepath.Join(dir, "auth.json.shared-a"), map[string]any{
 		"tokens": map[string]any{
+			"id_token":     testJWT(t, map[string]any{"chatgpt_plan_type": "pro"}),
 			"access_token": "shared-token",
 			"account_id":   "acct-1",
 		},
 	})
 	writeJSONFile(t, filepath.Join(dir, "auth.json.shared-b"), map[string]any{
 		"tokens": map[string]any{
+			"id_token":     testJWT(t, map[string]any{"chatgpt_plan_type": "pro"}),
 			"access_token": "shared-token",
 			"account_id":   "acct-1",
 		},
@@ -247,17 +320,14 @@ func TestEnrichCandidatesWithUsageDeduplicatesAndHandlesErrors(t *testing.T) {
 			if accountID != "acct-1" {
 				t.Fatalf("unexpected account id for shared token: %q", accountID)
 			}
-			writeJSONResponse(t, w, map[string]any{
-				"plan_type": "pro",
-				"rate_limit": map[string]any{
-					"primary_window": map[string]any{
-						"used_percent":         42,
-						"limit_window_seconds": 300,
-						"reset_at":             fixedNow.Add(3 * time.Minute).Unix(),
-					},
-				},
+			assertUsageProbeRequest(t, r, "Bearer shared-token", "acct-1")
+			writeUsageProbeResponse(t, w, map[string]string{
+				"x-codex-primary-used-percent":   "42",
+				"x-codex-primary-window-minutes": "5",
+				"x-codex-primary-reset-at":       fmt.Sprint(fixedNow.Add(3 * time.Minute).Unix()),
 			})
 		case "Bearer distinct-token":
+			assertUsageProbeRequest(t, r, "Bearer distinct-token", "")
 			w.WriteHeader(http.StatusUnauthorized)
 			writeJSONResponse(t, w, map[string]any{
 				"error": map[string]any{
@@ -278,7 +348,7 @@ func TestEnrichCandidatesWithUsageDeduplicatesAndHandlesErrors(t *testing.T) {
 		t.Fatalf("loadCandidates: %v", err)
 	}
 
-	enriched := enrichCandidatesWithUsage(candidates)
+	enriched := enrichCandidatesWithUsage(candidates, usageModeChat)
 	bySuffix := make(map[string]candidate, len(enriched))
 	for _, candidate := range enriched {
 		bySuffix[candidate.Suffix] = candidate
@@ -313,6 +383,120 @@ func TestEnrichCandidatesWithUsageDeduplicatesAndHandlesErrors(t *testing.T) {
 	}
 }
 
+func TestRequestAccountUsageViaAPIReadsUsagePayload(t *testing.T) {
+	fixedNow := time.Date(2026, 4, 4, 12, 0, 0, 0, time.UTC)
+	oldNow := nowFunc
+	nowFunc = func() time.Time { return fixedNow }
+	t.Cleanup(func() {
+		nowFunc = oldNow
+	})
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assertUsageAPIRequest(t, r, "Bearer api-token", "acct-api")
+		writeJSONResponse(t, w, map[string]any{
+			"plan_type": "pro",
+			"rate_limit": map[string]any{
+				"primary_window": map[string]any{
+					"used_percent":         42,
+					"limit_window_seconds": 5 * 60,
+					"reset_at":             fixedNow.Add(3 * time.Minute).Unix(),
+				},
+			},
+			"credits": map[string]any{
+				"has_credits": true,
+				"unlimited":   false,
+				"balance":     "9.99",
+			},
+		})
+	}))
+	t.Cleanup(server.Close)
+	setUsageBaseURLForTest(t, server.URL+"/backend-api")
+
+	snapshots, err := requestAccountUsageViaAPI(server.Client(), usageAuth{
+		AccessToken: "api-token",
+		AccountID:   "acct-api",
+	})
+	if err != nil {
+		t.Fatalf("requestAccountUsageViaAPI: %v", err)
+	}
+
+	summary := formatUsageSummary(snapshots)
+	if want := "Pro |  58% left in     3m | Credits 9.99"; summary != want {
+		t.Fatalf("unexpected API usage summary:\n got: %s\nwant: %s", summary, want)
+	}
+}
+
+func TestRequestAccountUsageReadsHeadersFromUsageLimitResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assertUsageProbeRequest(t, r, "Bearer exhausted-token", "")
+		for name, value := range map[string]string{
+			"x-codex-primary-used-percent":     "100",
+			"x-codex-primary-window-minutes":   "15",
+			"x-codex-secondary-used-percent":   "87.5",
+			"x-codex-secondary-window-minutes": "60",
+		} {
+			w.Header().Set(name, value)
+		}
+		w.WriteHeader(http.StatusTooManyRequests)
+		writeJSONResponse(t, w, map[string]any{
+			"error": map[string]any{
+				"type":    "usage_limit_reached",
+				"message": "limit reached",
+			},
+		})
+	}))
+	t.Cleanup(server.Close)
+	setUsageBaseURLForTest(t, server.URL+"/backend-api")
+
+	snapshots, err := requestAccountUsageViaChat(server.Client(), usageAuth{
+		AccessToken: "exhausted-token",
+		PlanType:    accountPlanTypePro,
+	})
+	if err != nil {
+		t.Fatalf("requestAccountUsageViaChat: %v", err)
+	}
+
+	summary := formatUsageSummary(snapshots)
+	if want := "Pro |   0% left / 15m | 12.5% left / 60m"; summary != want {
+		t.Fatalf("unexpected exhausted usage summary:\n got: %s\nwant: %s", summary, want)
+	}
+}
+
+func TestRequestAccountUsageViaChatIgnoresZeroOnlyHeaderWindow(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assertUsageProbeRequest(t, r, "Bearer zero-only-token", "")
+		writeUsageProbeResponse(t, w, map[string]string{
+			"x-codex-primary-used-percent": "0",
+		})
+	}))
+	t.Cleanup(server.Close)
+	setUsageBaseURLForTest(t, server.URL+"/backend-api")
+
+	snapshots, err := requestAccountUsageViaChat(server.Client(), usageAuth{
+		AccessToken: "zero-only-token",
+		PlanType:    accountPlanTypePro,
+	})
+	if err != nil {
+		t.Fatalf("requestAccountUsageViaChat: %v", err)
+	}
+	if len(snapshots) != 1 {
+		t.Fatalf("expected primary snapshot only, got %d", len(snapshots))
+	}
+	if snapshots[0].Primary != nil {
+		t.Fatalf("expected zero-only primary window to be ignored, got %#v", snapshots[0].Primary)
+	}
+
+	summary := formatUsageSummary(snapshots)
+	if strings.Contains(summary, "100% left") {
+		t.Fatalf("zero-only window should not report 100%% remaining, got %q", summary)
+	}
+
+	metrics := usageRemainingMetricsFromSnapshots(snapshots)
+	if metrics.HasFiveHourRemaining || metrics.HasSevenDayRemaining {
+		t.Fatalf("zero-only window should not provide default-selection metrics: %#v", metrics)
+	}
+}
+
 func TestEnrichCandidatesWithUsageStartsRequestsInStaggeredParallel(t *testing.T) {
 	dir := t.TempDir()
 
@@ -339,15 +523,10 @@ func TestEnrichCandidatesWithUsageStartsRequestsInStaggeredParallel(t *testing.T
 		mu.Unlock()
 
 		time.Sleep(200 * time.Millisecond)
-		writeJSONResponse(t, w, map[string]any{
-			"plan_type": "pro",
-			"rate_limit": map[string]any{
-				"primary_window": map[string]any{
-					"used_percent":         42,
-					"limit_window_seconds": 300,
-					"reset_at":             123,
-				},
-			},
+		writeUsageProbeResponse(t, w, map[string]string{
+			"x-codex-primary-used-percent":   "42",
+			"x-codex-primary-window-minutes": "5",
+			"x-codex-primary-reset-at":       "123",
 		})
 	}))
 	t.Cleanup(server.Close)
@@ -359,7 +538,7 @@ func TestEnrichCandidatesWithUsageStartsRequestsInStaggeredParallel(t *testing.T
 	}
 
 	start := time.Now()
-	enrichCandidatesWithUsage(candidates)
+	enrichCandidatesWithUsage(candidates, usageModeChat)
 	elapsed := time.Since(start)
 
 	mu.Lock()
@@ -385,4 +564,90 @@ func TestEnrichCandidatesWithUsageStartsRequestsInStaggeredParallel(t *testing.T
 
 func int64Ptr(value int64) *int64 {
 	return &value
+}
+
+func assertUsageProbeRequest(t *testing.T, r *http.Request, expectedAuth, expectedAccount string) {
+	t.Helper()
+
+	if r.Method != http.MethodPost {
+		t.Fatalf("unexpected method: %s", r.Method)
+	}
+	if r.URL.Path != "/backend-api/codex/responses" {
+		t.Fatalf("unexpected path: %s", r.URL.Path)
+	}
+	if got := r.Header.Get("Authorization"); got != expectedAuth {
+		t.Fatalf("unexpected auth header: %s", got)
+	}
+	if got := r.Header.Get("ChatGPT-Account-ID"); got != expectedAccount {
+		t.Fatalf("unexpected account header: %s", got)
+	}
+	if got := r.Header.Get("originator"); got == "" {
+		t.Fatal("expected originator header")
+	}
+	if got := r.Header.Get("User-Agent"); got == "" {
+		t.Fatal("expected User-Agent header")
+	}
+	if got := r.Header.Get("version"); got == "" {
+		t.Fatal("expected version header")
+	}
+
+	var body map[string]any
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		t.Fatalf("decode usage probe request: %v", err)
+	}
+	if got := body["model"]; got != defaultUsageProbeModel {
+		t.Fatalf("unexpected usage probe model: %#v", got)
+	}
+	if got := body["stream"]; got != true {
+		t.Fatalf("usage probe should be streaming, got %#v", got)
+	}
+	reasoning, ok := body["reasoning"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected reasoning object, got %#v", body["reasoning"])
+	}
+	if got := reasoning["effort"]; got != "none" {
+		t.Fatalf("unexpected reasoning effort: %#v", got)
+	}
+}
+
+func assertUsageAPIRequest(t *testing.T, r *http.Request, expectedAuth, expectedAccount string) {
+	t.Helper()
+
+	if r.Method != http.MethodGet {
+		t.Fatalf("unexpected method: %s", r.Method)
+	}
+	if r.URL.Path != "/backend-api/wham/usage" {
+		t.Fatalf("unexpected path: %s", r.URL.Path)
+	}
+	if got := r.Header.Get("Authorization"); got != expectedAuth {
+		t.Fatalf("unexpected auth header: %s", got)
+	}
+	if got := r.Header.Get("ChatGPT-Account-ID"); got != expectedAccount {
+		t.Fatalf("unexpected account header: %s", got)
+	}
+	if got := r.Header.Get("originator"); got == "" {
+		t.Fatal("expected originator header")
+	}
+	if got := r.Header.Get("User-Agent"); got == "" {
+		t.Fatal("expected User-Agent header")
+	}
+	if got := r.Header.Get("version"); got == "" {
+		t.Fatal("expected version header")
+	}
+}
+
+func writeUsageProbeResponse(t *testing.T, w http.ResponseWriter, headers map[string]string) {
+	t.Helper()
+
+	for name, value := range headers {
+		w.Header().Set(name, value)
+	}
+	writeJSONResponse(t, w, map[string]any{
+		"id": "resp_usage_probe",
+		"usage": map[string]any{
+			"input_tokens":  1,
+			"output_tokens": 1,
+			"total_tokens":  2,
+		},
+	})
 }

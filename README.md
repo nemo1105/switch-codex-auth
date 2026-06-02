@@ -22,24 +22,28 @@ Show the current auth profile and available backups:
 
 ```bash
 switch-codex-auth list
+switch-codex-auth list --usage chat
+switch-codex-auth list --usage api
 ```
 
 The list shows how many `auth.json.*` backups are available, along with relative ages
-such as `3h ago` or `3d ago` for each file's modified time, access time (when supported
-by the filesystem), `last_refresh` timestamp from the auth payload, and a live compact
-usage summary for ChatGPT-backed aliases.
+such as `3h ago` or `3d ago` for each file's `last_refresh` timestamp from the auth
+payload. Usage is not fetched by default and displays as `-`. Use `--usage chat` to
+fetch usage by sending a minimal Codex request and reading quota headers, or `--usage api`
+to use the direct usage endpoint.
 
 Open the interactive selector:
 
 ```bash
 switch-codex-auth
+switch-codex-auth --usage chat
 ```
 
-The interactive view shows the same live usage summaries before prompting for a selection.
-When a profile has remaining 5-hour usage, pressing `Enter` selects the default profile
-with the most 5-hour remaining usage, using 7-day remaining usage as the tie breaker.
-If every profile has 0% 5-hour remaining usage or usage is unavailable, no default is
-shown and an empty selection prompts again.
+The interactive view shows the same table before prompting for a selection. When usage is
+requested and a profile has remaining 5-hour usage, pressing `Enter` selects the default
+profile with the most 5-hour remaining usage, using 7-day remaining usage as the tie
+breaker. If usage is not requested, every profile has 0% 5-hour remaining usage, or usage
+is unavailable, no default is shown and an empty selection prompts again.
 After the list is shown, interactive mode refreshes stale aliases in the background.
 Selection remains available while refresh runs; after selection, the tool waits for any
 in-progress refresh, prints the refresh results, and syncs the active `auth.json` if the
@@ -91,7 +95,7 @@ You can override the directory with `CODEX_HOME`.
 
 - Scans `auth.json.*` files and lists them by suffix.
 - Shows the number of available auth files, marks the current alias with `*` in the index column, and displays relative `last_refresh` time when present.
-- Fetches live usage summaries for ChatGPT-backed aliases during `list` and bare interactive mode; rows show a compact remaining-quota summary, `n/a`, or a concise status/message error when usage is unavailable.
+- Leaves usage blank by default. `--usage chat` fetches usage for ChatGPT-backed aliases via a minimal Codex request, and `--usage api` uses the direct usage endpoint; rows show a compact remaining-quota summary, `n/a`, or a concise status/message error when usage is unavailable.
 - Detects which backup currently matches `auth.json`.
 - Replaces `auth.json` through a temp file in the same directory before renaming it into place.
 - Supports `list`, `use`, `save`, and `refresh` as explicit subcommands.

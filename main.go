@@ -52,7 +52,7 @@ func main() {
 func runCLI(args []string, in io.Reader, out io.Writer) error {
 	prog := filepath.Base(os.Args[0])
 	if len(args) == 0 {
-		return runInteractiveCommand(in, out)
+		return runInteractiveCommand(in, out, usageModeNone)
 	}
 
 	switch args[0] {
@@ -72,6 +72,13 @@ func runCLI(args []string, in io.Reader, out io.Writer) error {
 	default:
 		if err := legacyActionFlagError(args, prog); err != nil {
 			return err
+		}
+		if strings.HasPrefix(args[0], "-") {
+			usageMode, handled, err := parseRootInteractiveArgs(args, out, prog)
+			if handled || err != nil {
+				return err
+			}
+			return runInteractiveCommand(in, out, usageMode)
 		}
 
 		return fmt.Errorf("unknown command: %s (run `%s help` for usage)", args[0], prog)
@@ -106,12 +113,12 @@ func runHelpCommand(args []string, out io.Writer, prog string) error {
 }
 
 func runListSubcommand(args []string, out io.Writer, prog string) error {
-	handled, err := parseNoArgSubcommand("list", args, out, prog, writeListUsage)
+	usageMode, handled, err := parseListSubcommandArgs(args, out, prog)
 	if handled || err != nil {
 		return err
 	}
 
-	return runListCommand(out)
+	return runListCommand(out, usageMode)
 }
 
 func runUseSubcommand(args []string, out io.Writer, prog string) error {
@@ -141,8 +148,8 @@ func runRefreshSubcommand(args []string, out io.Writer, prog string) error {
 	return runRefreshCommand(out, options)
 }
 
-func runInteractiveCommand(in io.Reader, out io.Writer) error {
-	codexDir, candidates, current, currentMetadata, err := loadInteractiveState()
+func runInteractiveCommand(in io.Reader, out io.Writer, usageMode usageMode) error {
+	codexDir, candidates, current, currentMetadata, err := loadInteractiveState(usageMode)
 	if err != nil {
 		return err
 	}
@@ -150,8 +157,8 @@ func runInteractiveCommand(in io.Reader, out io.Writer) error {
 	return interactiveModeWithIO(codexDir, current, currentMetadata, candidates, in, out)
 }
 
-func runListCommand(out io.Writer) error {
-	codexDir, candidates, current, currentMetadata, err := loadInteractiveState()
+func runListCommand(out io.Writer, usageMode usageMode) error {
+	codexDir, candidates, current, currentMetadata, err := loadInteractiveState(usageMode)
 	if err != nil {
 		return err
 	}
@@ -192,28 +199,54 @@ func runRefreshCommand(out io.Writer, options refreshOptions) error {
 	return refreshAuthAliases(out, codexDir, candidates, options)
 }
 
-func parseNoArgSubcommand(
-	name string,
-	args []string,
-	out io.Writer,
-	prog string,
-	usage func(io.Writer, string),
-) (bool, error) {
-	flagSet := flag.NewFlagSet(name, flag.ContinueOnError)
+func parseRootInteractiveArgs(args []string, out io.Writer, prog string) (usageMode, bool, error) {
+	flagSet := flag.NewFlagSet(prog, flag.ContinueOnError)
 	flagSet.SetOutput(io.Discard)
+
+	usageValue := string(usageModeNone)
+	flagSet.StringVar(&usageValue, "usage", string(usageModeNone), "usage fetch mode: none, api, or chat")
 
 	if err := flagSet.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
-			usage(out, prog)
-			return true, nil
+			writeRootUsage(out, prog)
+			return usageModeNone, true, nil
 		}
-		return false, fmt.Errorf("%v (run `%s help %s` for usage)", err, prog, name)
+		return usageModeNone, false, fmt.Errorf("%v (run `%s help` for usage)", err, prog)
 	}
 	if flagSet.NArg() != 0 {
-		return false, fmt.Errorf("%s does not accept arguments (usage: %s %s)", name, prog, name)
+		return usageModeNone, false, fmt.Errorf("interactive mode does not accept arguments (usage: %s [--usage none|api|chat])", prog)
 	}
 
-	return false, nil
+	mode, err := parseUsageMode(usageValue)
+	if err != nil {
+		return usageModeNone, false, fmt.Errorf("%v (run `%s help` for usage)", err, prog)
+	}
+	return mode, false, nil
+}
+
+func parseListSubcommandArgs(args []string, out io.Writer, prog string) (usageMode, bool, error) {
+	flagSet := flag.NewFlagSet("list", flag.ContinueOnError)
+	flagSet.SetOutput(io.Discard)
+
+	usageValue := string(usageModeNone)
+	flagSet.StringVar(&usageValue, "usage", string(usageModeNone), "usage fetch mode: none, api, or chat")
+
+	if err := flagSet.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			writeListUsage(out, prog)
+			return usageModeNone, true, nil
+		}
+		return usageModeNone, false, fmt.Errorf("%v (run `%s help list` for usage)", err, prog)
+	}
+	if flagSet.NArg() != 0 {
+		return usageModeNone, false, fmt.Errorf("list does not accept arguments (usage: %s list [--usage none|api|chat])", prog)
+	}
+
+	mode, err := parseUsageMode(usageValue)
+	if err != nil {
+		return usageModeNone, false, fmt.Errorf("%v (run `%s help list` for usage)", err, prog)
+	}
+	return mode, false, nil
 }
 
 func parseUseSubcommandArgs(args []string, out io.Writer, prog string) (string, bool, error) {
@@ -330,24 +363,28 @@ func legacyActionFlagError(args []string, prog string) error {
 
 func writeRootUsage(w io.Writer, prog string) {
 	fmt.Fprintf(w, "Usage:\n")
-	fmt.Fprintf(w, "  %s\n", prog)
-	fmt.Fprintf(w, "  %s list\n", prog)
+	fmt.Fprintf(w, "  %s [--usage none|api|chat]\n", prog)
+	fmt.Fprintf(w, "  %s list [--usage none|api|chat]\n", prog)
 	fmt.Fprintf(w, "  %s use <suffix-or-index>\n", prog)
 	fmt.Fprintf(w, "  %s save <suffix> [-f|--force]\n", prog)
 	fmt.Fprintf(w, "  %s refresh [-f|--force] [--days N]\n", prog)
 	fmt.Fprintf(w, "  %s help [command]\n", prog)
 	fmt.Fprintf(w, "\nCommands:\n")
-	fmt.Fprintf(w, "  list     Show the current auth, auth.json.* files, and live usage summaries\n")
+	fmt.Fprintf(w, "  list     Show the current auth and auth.json.* files, optionally with usage summaries\n")
 	fmt.Fprintf(w, "  use      Switch to auth.json.<suffix> or a menu index\n")
 	fmt.Fprintf(w, "  save     Copy the current auth.json to auth.json.<suffix>\n")
 	fmt.Fprintf(w, "  refresh  Refresh auth.json.* files whose last_refresh is at least N days old unless forced (default 7)\n")
+	fmt.Fprintf(w, "\nOptions:\n")
+	fmt.Fprintf(w, "  --usage  Usage fetch mode for list and interactive mode: none, api, or chat (default none)\n")
 	fmt.Fprintf(w, "\nEnvironment:\n")
 	fmt.Fprintf(w, "  CODEX_HOME  Override the auth directory. Defaults to %s\n", defaultCodexHomeHint())
 }
 
 func writeListUsage(w io.Writer, prog string) {
 	fmt.Fprintf(w, "Usage:\n")
-	fmt.Fprintf(w, "  %s list\n", prog)
+	fmt.Fprintf(w, "  %s list [--usage none|api|chat]\n", prog)
+	fmt.Fprintf(w, "\nOptions:\n")
+	fmt.Fprintf(w, "  --usage  Usage fetch mode: none, api, or chat (default none)\n")
 }
 
 func writeUseUsage(w io.Writer, prog string) {
@@ -365,7 +402,7 @@ func writeRefreshUsage(w io.Writer, prog string) {
 	fmt.Fprintf(w, "  %s refresh [-f|--force] [--days N]\n", prog)
 }
 
-func loadInteractiveState() (string, []candidate, string, *authMetadata, error) {
+func loadInteractiveState(usageMode usageMode) (string, []candidate, string, *authMetadata, error) {
 	codexDir, err := codexHome()
 	if err != nil {
 		return "", nil, "", nil, err
@@ -386,7 +423,9 @@ func loadInteractiveState() (string, []candidate, string, *authMetadata, error) 
 		return "", nil, "", nil, err
 	}
 
-	candidates = enrichCandidatesWithUsageFunc(candidates)
+	if usageMode != usageModeNone {
+		candidates = enrichCandidatesWithUsageFunc(candidates, usageMode)
+	}
 
 	return codexDir, candidates, current, currentMetadata, nil
 }
@@ -666,7 +705,7 @@ func printStatus(w io.Writer, codexDir, current string, currentMetadata *authMet
 	fmt.Fprintln(w, "Hint:")
 	fmt.Fprintln(w, "  * marks the current alias")
 	fmt.Fprintln(w, "  Last refresh is a local file signal")
-	fmt.Fprintln(w, "  Usage is live account data and may show n/a or a concise error per alias")
+	fmt.Fprintln(w, "  Usage is shown only with --usage api|chat and may show n/a or a concise error per alias")
 }
 
 func formatUsageDisplay(value string) string {

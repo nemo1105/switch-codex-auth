@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -12,7 +13,7 @@ import (
 	"time"
 )
 
-func TestRunCLIBareCommandUsesInteractiveMode(t *testing.T) {
+func TestRunCLIBareCommandUsesInteractiveModeWithoutUsageByDefault(t *testing.T) {
 	fixedNow := time.Date(2026, 4, 4, 12, 0, 0, 0, time.UTC)
 	oldNow := nowFunc
 	nowFunc = func() time.Time { return fixedNow }
@@ -24,35 +25,31 @@ func TestRunCLIBareCommandUsesInteractiveMode(t *testing.T) {
 	t.Setenv("CODEX_HOME", dir)
 	writeJSONFile(t, filepath.Join(dir, "auth.json"), map[string]any{
 		"tokens": map[string]any{
-			"id_token":     testJWT(t, map[string]any{"email": "demo@example.com"}),
+			"id_token":     testJWT(t, map[string]any{"email": "demo@example.com", "chatgpt_plan_type": "plus"}),
 			"access_token": "interactive-token",
 		},
 	})
 	writeJSONFile(t, filepath.Join(dir, "auth.json.demo"), map[string]any{
 		"tokens": map[string]any{
-			"id_token":     testJWT(t, map[string]any{"email": "demo@example.com"}),
+			"id_token":     testJWT(t, map[string]any{"email": "demo@example.com", "chatgpt_plan_type": "plus"}),
 			"access_token": "interactive-token",
 		},
 	})
 
+	usageRequested := false
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		writeJSONResponse(t, w, map[string]any{
-			"plan_type": "plus",
-			"rate_limit": map[string]any{
-				"primary_window": map[string]any{
-					"used_percent":         25,
-					"limit_window_seconds": int64(5 * time.Hour / time.Second),
-					"reset_at":             fixedNow.Add(3 * time.Minute).Unix(),
-				},
-			},
-		})
+		usageRequested = true
+		t.Fatalf("usage request should not be sent by default")
 	}))
 	t.Cleanup(server.Close)
 	setUsageBaseURLForTest(t, server.URL+"/backend-api")
 
 	var out bytes.Buffer
-	if err := runCLI(nil, strings.NewReader("\n"), &out); err != nil {
+	if err := runCLI(nil, strings.NewReader("demo\n"), &out); err != nil {
 		t.Fatalf("runCLI: %v", err)
+	}
+	if usageRequested {
+		t.Fatal("usage request was sent")
 	}
 
 	output := out.String()
@@ -62,14 +59,17 @@ func TestRunCLIBareCommandUsesInteractiveMode(t *testing.T) {
 	if !strings.Contains(output, " * 1 demo") {
 		t.Fatalf("expected current alias marker in output, got:\n%s", output)
 	}
-	if !strings.Contains(output, "Plus |  75% left in     3m") {
-		t.Fatalf("expected usage summary in output, got:\n%s", output)
+	if !strings.Contains(output, "Usage") || !strings.Contains(output, " -") {
+		t.Fatalf("expected empty usage display in output, got:\n%s", output)
 	}
-	if !strings.Contains(output, "Choose auth file by number or suffix [default: demo]: ") {
+	if !strings.Contains(output, "Choose auth file by number or suffix: ") {
 		t.Fatalf("expected interactive prompt, got:\n%s", output)
 	}
+	if strings.Contains(output, "[default: demo]") {
+		t.Fatalf("did not expect default prompt without usage, got:\n%s", output)
+	}
 	if !strings.Contains(output, "Already using: demo") {
-		t.Fatalf("expected empty input to select the default profile, got:\n%s", output)
+		t.Fatalf("expected explicit suffix to select the profile, got:\n%s", output)
 	}
 }
 
@@ -85,19 +85,19 @@ func TestRunCLIBareCommandEnterSwitchesToDefaultCandidate(t *testing.T) {
 	t.Setenv("CODEX_HOME", dir)
 	writeJSONFile(t, filepath.Join(dir, "auth.json"), map[string]any{
 		"tokens": map[string]any{
-			"id_token":     testJWT(t, map[string]any{"email": "active@example.com"}),
+			"id_token":     testJWT(t, map[string]any{"email": "active@example.com", "chatgpt_plan_type": "pro"}),
 			"access_token": "active-token",
 		},
 	})
 	bestBytes := writeJSONFile(t, filepath.Join(dir, "auth.json.best"), map[string]any{
 		"tokens": map[string]any{
-			"id_token":     testJWT(t, map[string]any{"email": "best@example.com"}),
+			"id_token":     testJWT(t, map[string]any{"email": "best@example.com", "chatgpt_plan_type": "pro"}),
 			"access_token": "best-token",
 		},
 	})
 	writeJSONFile(t, filepath.Join(dir, "auth.json.low"), map[string]any{
 		"tokens": map[string]any{
-			"id_token":     testJWT(t, map[string]any{"email": "low@example.com"}),
+			"id_token":     testJWT(t, map[string]any{"email": "low@example.com", "chatgpt_plan_type": "pro"}),
 			"access_token": "low-token",
 		},
 	})
@@ -107,27 +107,20 @@ func TestRunCLIBareCommandEnterSwitchesToDefaultCandidate(t *testing.T) {
 		if strings.TrimSpace(r.Header.Get("Authorization")) == "Bearer best-token" {
 			usedPercent = 20
 		}
-		writeJSONResponse(t, w, map[string]any{
-			"plan_type": "pro",
-			"rate_limit": map[string]any{
-				"primary_window": map[string]any{
-					"used_percent":         usedPercent,
-					"limit_window_seconds": int64(5 * time.Hour / time.Second),
-					"reset_at":             fixedNow.Add(2 * time.Hour).Unix(),
-				},
-				"secondary_window": map[string]any{
-					"used_percent":         10,
-					"limit_window_seconds": int64(7 * 24 * time.Hour / time.Second),
-					"reset_at":             fixedNow.Add(6 * 24 * time.Hour).Unix(),
-				},
-			},
+		writeUsageProbeResponse(t, w, map[string]string{
+			"x-codex-primary-used-percent":     fmt.Sprint(usedPercent),
+			"x-codex-primary-window-minutes":   fmt.Sprint(int64(5 * time.Hour / time.Minute)),
+			"x-codex-primary-reset-at":         fmt.Sprint(fixedNow.Add(2 * time.Hour).Unix()),
+			"x-codex-secondary-used-percent":   "10",
+			"x-codex-secondary-window-minutes": fmt.Sprint(int64(7 * 24 * time.Hour / time.Minute)),
+			"x-codex-secondary-reset-at":       fmt.Sprint(fixedNow.Add(6 * 24 * time.Hour).Unix()),
 		})
 	}))
 	t.Cleanup(server.Close)
 	setUsageBaseURLForTest(t, server.URL+"/backend-api")
 
 	var out bytes.Buffer
-	if err := runCLI(nil, strings.NewReader("\n"), &out); err != nil {
+	if err := runCLI([]string{"--usage", "chat"}, strings.NewReader("\n"), &out); err != nil {
 		t.Fatalf("runCLI: %v", err)
 	}
 
@@ -274,7 +267,7 @@ func TestRunCLIBareCommandDoesNotStartBackgroundRefreshWithoutStaleAliases(t *te
 	}
 }
 
-func TestRunCLIListCommandDisplaysStatus(t *testing.T) {
+func TestRunCLIListCommandDoesNotRequestUsageByDefault(t *testing.T) {
 	fixedNow := time.Date(2026, 4, 4, 12, 0, 0, 0, time.UTC)
 	oldNow := nowFunc
 	nowFunc = func() time.Time { return fixedNow }
@@ -286,62 +279,90 @@ func TestRunCLIListCommandDisplaysStatus(t *testing.T) {
 	t.Setenv("CODEX_HOME", dir)
 	writeJSONFile(t, filepath.Join(dir, "auth.json"), map[string]any{
 		"tokens": map[string]any{
-			"id_token":     testJWT(t, map[string]any{"email": "demo@example.com"}),
+			"id_token":     testJWT(t, map[string]any{"email": "demo@example.com", "chatgpt_plan_type": "pro"}),
 			"access_token": "demo-token",
-			"account_id":   "acct-demo",
 		},
 	})
 	writeJSONFile(t, filepath.Join(dir, "auth.json.demo"), map[string]any{
 		"tokens": map[string]any{
-			"id_token":     testJWT(t, map[string]any{"email": "demo@example.com"}),
+			"id_token":     testJWT(t, map[string]any{"email": "demo@example.com", "chatgpt_plan_type": "pro"}),
 			"access_token": "demo-token",
-			"account_id":   "acct-demo",
 		},
 	})
 
+	usageRequested := false
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			t.Fatalf("unexpected method: %s", r.Method)
-		}
-		if r.URL.Path != "/backend-api/wham/usage" {
-			t.Fatalf("unexpected path: %s", r.URL.Path)
-		}
-		if got := r.Header.Get("Authorization"); got != "Bearer demo-token" {
-			t.Fatalf("unexpected auth header: %s", got)
-		}
-		if got := r.Header.Get("ChatGPT-Account-ID"); got != "acct-demo" {
-			t.Fatalf("unexpected account header: %s", got)
-		}
-		if got := r.Header.Get("originator"); got == "" {
-			t.Fatal("expected originator header")
-		}
-		if got := r.Header.Get("User-Agent"); got == "" {
-			t.Fatal("expected User-Agent header")
-		}
-		if got := r.Header.Get("version"); got == "" {
-			t.Fatal("expected version header")
-		}
-		writeJSONResponse(t, w, map[string]any{
-			"plan_type": "pro",
-			"rate_limit": map[string]any{
-				"primary_window": map[string]any{
-					"used_percent":         42,
-					"limit_window_seconds": 300,
-					"reset_at":             fixedNow.Add(3 * time.Minute).Unix(),
-				},
-			},
-			"credits": map[string]any{
-				"has_credits": true,
-				"unlimited":   false,
-				"balance":     "9.99",
-			},
-		})
+		usageRequested = true
+		t.Fatalf("usage request should not be sent by default")
 	}))
 	t.Cleanup(server.Close)
 	setUsageBaseURLForTest(t, server.URL+"/backend-api")
 
 	var out bytes.Buffer
 	if err := runCLI([]string{"list"}, strings.NewReader(""), &out); err != nil {
+		t.Fatalf("runCLI: %v", err)
+	}
+	if usageRequested {
+		t.Fatal("usage request was sent")
+	}
+
+	output := out.String()
+	for _, want := range []string{
+		"Available auth files (1):",
+		"Usage",
+		" * 1 demo",
+		" -",
+	} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("expected list output to contain %q, got:\n%s", want, output)
+		}
+	}
+	if strings.Contains(output, "Pro |") {
+		t.Fatalf("did not expect usage summary without --usage, got:\n%s", output)
+	}
+}
+
+func TestRunCLIListCommandDisplaysChatUsage(t *testing.T) {
+	fixedNow := time.Date(2026, 4, 4, 12, 0, 0, 0, time.UTC)
+	oldNow := nowFunc
+	nowFunc = func() time.Time { return fixedNow }
+	t.Cleanup(func() {
+		nowFunc = oldNow
+	})
+
+	dir := t.TempDir()
+	t.Setenv("CODEX_HOME", dir)
+	writeJSONFile(t, filepath.Join(dir, "auth.json"), map[string]any{
+		"tokens": map[string]any{
+			"id_token":     testJWT(t, map[string]any{"email": "demo@example.com", "chatgpt_plan_type": "pro"}),
+			"access_token": "demo-token",
+			"account_id":   "acct-demo",
+		},
+	})
+	writeJSONFile(t, filepath.Join(dir, "auth.json.demo"), map[string]any{
+		"tokens": map[string]any{
+			"id_token":     testJWT(t, map[string]any{"email": "demo@example.com", "chatgpt_plan_type": "pro"}),
+			"access_token": "demo-token",
+			"account_id":   "acct-demo",
+		},
+	})
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assertUsageProbeRequest(t, r, "Bearer demo-token", "acct-demo")
+		writeUsageProbeResponse(t, w, map[string]string{
+			"x-codex-primary-used-percent":   "42",
+			"x-codex-primary-window-minutes": "5",
+			"x-codex-primary-reset-at":       fmt.Sprint(fixedNow.Add(3 * time.Minute).Unix()),
+			"x-codex-credits-has-credits":    "true",
+			"x-codex-credits-unlimited":      "false",
+			"x-codex-credits-balance":        "9.99",
+		})
+	}))
+	t.Cleanup(server.Close)
+	setUsageBaseURLForTest(t, server.URL+"/backend-api")
+
+	var out bytes.Buffer
+	if err := runCLI([]string{"list", "--usage", "chat"}, strings.NewReader(""), &out); err != nil {
 		t.Fatalf("runCLI: %v", err)
 	}
 
@@ -366,6 +387,58 @@ func TestRunCLIListCommandDisplaysStatus(t *testing.T) {
 	}
 	if strings.Contains(output, "Choose auth file by number or suffix") {
 		t.Fatalf("list command should not prompt, got:\n%s", output)
+	}
+}
+
+func TestRunCLIListCommandDisplaysAPIUsage(t *testing.T) {
+	fixedNow := time.Date(2026, 4, 4, 12, 0, 0, 0, time.UTC)
+	oldNow := nowFunc
+	nowFunc = func() time.Time { return fixedNow }
+	t.Cleanup(func() {
+		nowFunc = oldNow
+	})
+
+	dir := t.TempDir()
+	t.Setenv("CODEX_HOME", dir)
+	writeJSONFile(t, filepath.Join(dir, "auth.json"), map[string]any{
+		"tokens": map[string]any{
+			"id_token":     testJWT(t, map[string]any{"email": "api@example.com", "chatgpt_plan_type": "plus"}),
+			"access_token": "api-token",
+			"account_id":   "acct-api",
+		},
+	})
+	writeJSONFile(t, filepath.Join(dir, "auth.json.api"), map[string]any{
+		"tokens": map[string]any{
+			"id_token":     testJWT(t, map[string]any{"email": "api@example.com", "chatgpt_plan_type": "plus"}),
+			"access_token": "api-token",
+			"account_id":   "acct-api",
+		},
+	})
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assertUsageAPIRequest(t, r, "Bearer api-token", "acct-api")
+		writeJSONResponse(t, w, map[string]any{
+			"plan_type": "plus",
+			"rate_limit": map[string]any{
+				"primary_window": map[string]any{
+					"used_percent":         20,
+					"limit_window_seconds": 5 * 60,
+					"reset_at":             fixedNow.Add(4 * time.Minute).Unix(),
+				},
+			},
+		})
+	}))
+	t.Cleanup(server.Close)
+	setUsageBaseURLForTest(t, server.URL+"/backend-api")
+
+	var out bytes.Buffer
+	if err := runCLI([]string{"list", "--usage", "api"}, strings.NewReader(""), &out); err != nil {
+		t.Fatalf("runCLI: %v", err)
+	}
+
+	output := out.String()
+	if !strings.Contains(output, "Plus |  80% left in     4m") {
+		t.Fatalf("expected API usage summary, got:\n%s", output)
 	}
 }
 
@@ -600,6 +673,33 @@ func TestRunCLILegacyFlagsFailWithMigrationGuidance(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "use demo") {
 		t.Fatalf("expected migration guidance, got: %v", err)
+	}
+}
+
+func TestRunCLIRejectsInvalidUsageMode(t *testing.T) {
+	for _, args := range [][]string{
+		{"--usage", "bad"},
+		{"list", "--usage", "bad"},
+	} {
+		var out bytes.Buffer
+		err := runCLI(args, strings.NewReader(""), &out)
+		if err == nil {
+			t.Fatalf("expected invalid usage mode error for %v", args)
+		}
+		if !strings.Contains(err.Error(), "usage must be one of: none, api, chat") {
+			t.Fatalf("unexpected error for %v: %v", args, err)
+		}
+	}
+}
+
+func TestRunCLIRejectsUsageFlagOnUseCommand(t *testing.T) {
+	var out bytes.Buffer
+	err := runCLI([]string{"use", "--usage", "chat", "demo"}, strings.NewReader(""), &out)
+	if err == nil {
+		t.Fatal("expected use --usage error")
+	}
+	if !strings.Contains(err.Error(), "flag provided but not defined") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 
