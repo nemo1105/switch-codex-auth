@@ -67,6 +67,8 @@ func runCLI(args []string, in io.Reader, out io.Writer) error {
 		return runUseSubcommand(args[1:], out, prog)
 	case "save":
 		return runSaveSubcommand(args[1:], in, out, prog)
+	case "login":
+		return runLoginSubcommand(args[1:], in, out, prog)
 	case "refresh":
 		return runRefreshSubcommand(args[1:], out, prog)
 	default:
@@ -100,6 +102,9 @@ func runHelpCommand(args []string, out io.Writer, prog string) error {
 			return nil
 		case "save":
 			writeSaveUsage(out, prog)
+			return nil
+		case "login":
+			writeLoginUsage(out, prog)
 			return nil
 		case "refresh":
 			writeRefreshUsage(out, prog)
@@ -137,6 +142,15 @@ func runSaveSubcommand(args []string, in io.Reader, out io.Writer, prog string) 
 	}
 
 	return runSaveCommand(selection, force, in, out)
+}
+
+func runLoginSubcommand(args []string, in io.Reader, out io.Writer, prog string) error {
+	selection, force, handled, err := parseLoginSubcommandArgs(args, out, prog)
+	if handled || err != nil {
+		return err
+	}
+
+	return runLoginCommand(selection, force, in, out)
 }
 
 func runRefreshSubcommand(args []string, out io.Writer, prog string) error {
@@ -183,6 +197,15 @@ func runSaveCommand(selection string, force bool, in io.Reader, out io.Writer) e
 	}
 
 	return saveCurrentAsWithIO(codexDir, selection, force, in, out, isInteractiveReader(in))
+}
+
+func runLoginCommand(selection string, force bool, in io.Reader, out io.Writer) error {
+	codexDir, err := codexHome()
+	if err != nil {
+		return err
+	}
+
+	return loginAndSaveAlias(codexDir, selection, force, in, out, isInteractiveReader(in))
 }
 
 func runRefreshCommand(out io.Writer, options refreshOptions) error {
@@ -297,6 +320,32 @@ func parseSaveSubcommandArgs(args []string, out io.Writer, prog string) (string,
 	}
 }
 
+func parseLoginSubcommandArgs(args []string, out io.Writer, prog string) (string, bool, bool, error) {
+	flagSet := flag.NewFlagSet("login", flag.ContinueOnError)
+	flagSet.SetOutput(io.Discard)
+
+	var force bool
+	flagSet.BoolVar(&force, "f", false, "overwrite an existing auth alias")
+	flagSet.BoolVar(&force, "force", false, "overwrite an existing auth alias")
+
+	if err := flagSet.Parse(normalizeSaveArgs(args)); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			writeLoginUsage(out, prog)
+			return "", false, true, nil
+		}
+		return "", false, false, fmt.Errorf("%v (run `%s help login` for usage)", err, prog)
+	}
+
+	switch flagSet.NArg() {
+	case 0:
+		return "", force, false, nil
+	case 1:
+		return flagSet.Arg(0), force, false, nil
+	default:
+		return "", false, false, fmt.Errorf("login accepts at most one <suffix> (usage: %s login [suffix] [-f|--force])", prog)
+	}
+}
+
 func parseRefreshSubcommandArgs(args []string, out io.Writer, prog string) (refreshOptions, bool, error) {
 	flagSet := flag.NewFlagSet("refresh", flag.ContinueOnError)
 	flagSet.SetOutput(io.Discard)
@@ -352,6 +401,8 @@ func legacyActionFlagError(args []string, prog string) error {
 		replacement = append([]string{"use"}, args[1:]...)
 	case "--save":
 		replacement = append([]string{"save"}, args[1:]...)
+	case "--login":
+		replacement = append([]string{"login"}, args[1:]...)
 	case "--refresh":
 		replacement = append([]string{"refresh"}, args[1:]...)
 	default:
@@ -367,12 +418,14 @@ func writeRootUsage(w io.Writer, prog string) {
 	fmt.Fprintf(w, "  %s list [--usage none|api|chat]\n", prog)
 	fmt.Fprintf(w, "  %s use <suffix-or-index>\n", prog)
 	fmt.Fprintf(w, "  %s save <suffix> [-f|--force]\n", prog)
+	fmt.Fprintf(w, "  %s login [suffix] [-f|--force]\n", prog)
 	fmt.Fprintf(w, "  %s refresh [-f|--force] [--days N]\n", prog)
 	fmt.Fprintf(w, "  %s help [command]\n", prog)
 	fmt.Fprintf(w, "\nCommands:\n")
 	fmt.Fprintf(w, "  list     Show the current auth and auth.json.* files, optionally with usage summaries\n")
 	fmt.Fprintf(w, "  use      Switch to auth.json.<suffix> or a menu index\n")
 	fmt.Fprintf(w, "  save     Copy the current auth.json to auth.json.<suffix>\n")
+	fmt.Fprintf(w, "  login    Sign in with Codex OAuth and save the new auth as auth.json.<suffix>\n")
 	fmt.Fprintf(w, "  refresh  Refresh auth.json.* files whose last_refresh is at least N days old unless forced (default 7)\n")
 	fmt.Fprintf(w, "\nOptions:\n")
 	fmt.Fprintf(w, "  --usage  Usage fetch mode for list and interactive mode: none, api, or chat (default none)\n")
@@ -395,6 +448,11 @@ func writeUseUsage(w io.Writer, prog string) {
 func writeSaveUsage(w io.Writer, prog string) {
 	fmt.Fprintf(w, "Usage:\n")
 	fmt.Fprintf(w, "  %s save <suffix> [-f|--force]\n", prog)
+}
+
+func writeLoginUsage(w io.Writer, prog string) {
+	fmt.Fprintf(w, "Usage:\n")
+	fmt.Fprintf(w, "  %s login [suffix] [-f|--force]\n", prog)
 }
 
 func writeRefreshUsage(w io.Writer, prog string) {
@@ -1008,34 +1066,59 @@ func saveCurrentAsWithIO(codexDir, selection string, force bool, in io.Reader, o
 		return err
 	}
 
+	_, err = saveSourceAsAliasWithIO(codexDir, activePath, suffix, force, in, out, interactive, "Saved current auth as")
+	return err
+}
+
+func saveSourceAsAliasWithIO(
+	codexDir string,
+	sourcePath string,
+	suffix string,
+	force bool,
+	in io.Reader,
+	out io.Writer,
+	interactive bool,
+	successPrefix string,
+) (string, error) {
 	var reader *bufio.Reader
 	if interactive {
 		reader = bufio.NewReader(in)
 	}
+	return saveSourceAsAliasWithReader(codexDir, sourcePath, suffix, force, reader, out, successPrefix)
+}
 
+func saveSourceAsAliasWithReader(
+	codexDir string,
+	sourcePath string,
+	suffix string,
+	force bool,
+	reader *bufio.Reader,
+	out io.Writer,
+	successPrefix string,
+) (string, error) {
 	for {
 		targetPath := filepath.Join(codexDir, "auth.json."+suffix)
 		if _, err := os.Stat(targetPath); err == nil {
 			switch {
 			case force:
-				if err := copyFileToTarget(activePath, targetPath, true); err != nil {
-					return err
+				if err := copyFileToTarget(sourcePath, targetPath, true); err != nil {
+					return "", err
 				}
 				fmt.Fprintf(out, "Overwrote auth alias: %s\n", suffix)
-				return nil
-			case !interactive:
-				return fmt.Errorf("auth alias already exists: %s (use --force to overwrite or choose a different alias)", filepath.Base(targetPath))
+				return suffix, nil
+			case reader == nil:
+				return "", fmt.Errorf("auth alias already exists: %s (use --force to overwrite or choose a different alias)", filepath.Base(targetPath))
 			default:
 				nextSuffix, overwrite, err := promptForSaveConflict(reader, out, targetPath)
 				if err != nil {
-					return err
+					return "", err
 				}
 				if overwrite {
-					if err := copyFileToTarget(activePath, targetPath, true); err != nil {
-						return err
+					if err := copyFileToTarget(sourcePath, targetPath, true); err != nil {
+						return "", err
 					}
 					fmt.Fprintf(out, "Overwrote auth alias: %s\n", suffix)
-					return nil
+					return suffix, nil
 				}
 				if nextSuffix == "" {
 					continue
@@ -1044,15 +1127,15 @@ func saveCurrentAsWithIO(codexDir, selection string, force bool, in io.Reader, o
 				continue
 			}
 		} else if !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("stat %s: %w", targetPath, err)
+			return "", fmt.Errorf("stat %s: %w", targetPath, err)
 		}
 
-		if err := copyFileToTarget(activePath, targetPath, false); err != nil {
-			return err
+		if err := copyFileToTarget(sourcePath, targetPath, false); err != nil {
+			return "", err
 		}
 
-		fmt.Fprintf(out, "Saved current auth as: %s\n", suffix)
-		return nil
+		fmt.Fprintf(out, "%s: %s\n", successPrefix, suffix)
+		return suffix, nil
 	}
 }
 

@@ -69,6 +69,18 @@ If the alias already exists, interactive terminals prompt you to press `Enter` t
 or type a different alias to save under. In non-interactive environments, use `--force`
 with `save` to overwrite an existing alias.
 
+Sign in with Codex OAuth and save the new credentials as an alias:
+
+```bash
+switch-codex-auth login
+switch-codex-auth login demo
+switch-codex-auth login demo --force
+```
+
+`login` prints and opens the Codex OAuth URL, waits for browser sign-in, then saves the
+new credentials as `auth.json.<suffix>`. It does not revoke, overwrite, or otherwise
+modify the active `auth.json`.
+
 Refresh every refreshable `auth.json.*` alias:
 
 ```bash
@@ -98,8 +110,9 @@ You can override the directory with `CODEX_HOME`.
 - Leaves usage blank by default. `--usage chat` fetches usage for ChatGPT-backed aliases via a minimal Codex request, and `--usage api` uses the direct usage endpoint; rows show a compact remaining-quota summary, `n/a`, or a concise status/message error when usage is unavailable.
 - Detects which backup currently matches `auth.json`.
 - Replaces `auth.json` through a temp file in the same directory before renaming it into place.
-- Supports `list`, `use`, `save`, and `refresh` as explicit subcommands.
+- Supports `list`, `use`, `save`, `login`, and `refresh` as explicit subcommands.
 - Saves a new alias with `save <suffix>`, prompting before overwriting an existing `auth.json.<suffix>` in interactive terminals.
+- Saves a new OAuth login with `login [suffix]`, prompting for the suffix after sign-in when omitted.
 - Supports `-f` / `--force` with `save` to overwrite an existing alias without prompting, and with `refresh` to skip `last_refresh` checks.
 - Refreshes `auth.json.*` aliases with `refresh`, defaulting to entries whose `last_refresh` is at least 7 days old or missing, and grouping identical `refresh_token` values so the same token is refreshed only once.
 - Supports number selection, suffix selection, usage-based default selection, and background stale-alias refresh in interactive mode.
