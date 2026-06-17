@@ -75,10 +75,13 @@ Sign in with Codex OAuth and save the new credentials as an alias:
 switch-codex-auth login
 switch-codex-auth login demo
 switch-codex-auth login demo --force
+switch-codex-auth login demo -p
+switch-codex-auth login demo --print-url-only
 ```
 
 `login` prints and opens the Codex OAuth URL, waits for browser sign-in, then saves the
-new credentials as `auth.json.<suffix>`. It does not revoke, overwrite, or otherwise
+new credentials as `auth.json.<suffix>`. Use `-p` or `--print-url-only` to print the URL
+without opening a browser automatically. It does not revoke, overwrite, or otherwise
 modify the active `auth.json`.
 
 Refresh every refreshable `auth.json.*` alias:

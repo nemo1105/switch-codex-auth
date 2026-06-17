@@ -180,7 +180,7 @@ func TestLoginPromptsForAliasAndRetriesInvalidInput(t *testing.T) {
 
 	var out bytes.Buffer
 	input := strings.NewReader("bad/name\ncustom\n")
-	if err := loginAndSaveAlias(dir, "", false, input, &out, true); err != nil {
+	if err := loginAndSaveAlias(dir, "", loginOptions{}, input, &out, true); err != nil {
 		t.Fatalf("loginAndSaveAlias: %v", err)
 	}
 
@@ -295,14 +295,112 @@ func TestRunCLILoginForceOverwritesExistingAlias(t *testing.T) {
 	}
 }
 
+func TestRunCLILoginPrintURLOnlyDoesNotOpenBrowser(t *testing.T) {
+	for _, printURLFlag := range []string{"-p", "--print-url-only"} {
+		printURLFlag := printURLFlag
+		t.Run(printURLFlag, func(t *testing.T) {
+			dir := t.TempDir()
+			t.Setenv("CODEX_HOME", dir)
+
+			idToken := testJWT(t, map[string]any{"email": "login@example.com"})
+			tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if err := r.ParseForm(); err != nil {
+					t.Fatalf("ParseForm: %v", err)
+				}
+				writeJSONResponse(t, w, map[string]any{
+					"id_token":      idToken,
+					"access_token":  "oauth-access",
+					"refresh_token": "oauth-refresh",
+				})
+			}))
+			t.Cleanup(tokenServer.Close)
+
+			var opened bool
+			withLoginTestConfig(t, tokenServer.URL, func(rawURL string) error {
+				opened = true
+				return nil
+			})
+
+			out := &loginURLCallbackWriter{t: t}
+			if err := runCLI([]string{"login", "demo", printURLFlag}, strings.NewReader(""), out); err != nil {
+				t.Fatalf("runCLI: %v", err)
+			}
+
+			if opened {
+				t.Fatalf("browser opener should not be called with %s", printURLFlag)
+			}
+			if !out.callbackRequested {
+				t.Fatalf("expected printed login URL to be used for callback, got:\n%s", out.String())
+			}
+			if got := readJSONFile(t, filepath.Join(dir, "auth.json.demo")); nestedMap(t, got, "tokens")["access_token"] != "oauth-access" {
+				t.Fatalf("unexpected saved auth: %#v", got)
+			}
+			if output := out.String(); !strings.Contains(output, "Open this URL to log in:") || !strings.Contains(output, "Saved login auth as: demo") {
+				t.Fatalf("unexpected output:\n%s", output)
+			}
+		})
+	}
+}
+
 func TestRunCLIHelpLoginShowsUsage(t *testing.T) {
 	var out bytes.Buffer
 	if err := runCLI([]string{"help", "login"}, strings.NewReader(""), &out); err != nil {
 		t.Fatalf("runCLI: %v", err)
 	}
 
-	if got := out.String(); !strings.Contains(got, "login [suffix] [-f|--force]") {
+	if got := out.String(); !strings.Contains(got, "login [suffix] [-f|--force] [-p|--print-url-only]") ||
+		!strings.Contains(got, "-p, --print-url-only") {
 		t.Fatalf("unexpected help output:\n%s", got)
+	}
+}
+
+type loginURLCallbackWriter struct {
+	t                 *testing.T
+	buf               bytes.Buffer
+	callbackRequested bool
+}
+
+func (w *loginURLCallbackWriter) Write(p []byte) (int, error) {
+	n, err := w.buf.Write(p)
+	if !w.callbackRequested {
+		w.tryCallback()
+	}
+	return n, err
+}
+
+func (w *loginURLCallbackWriter) String() string {
+	return w.buf.String()
+}
+
+func (w *loginURLCallbackWriter) tryCallback() {
+	w.t.Helper()
+
+	const marker = "Open this URL to log in:\n\n"
+	output := w.buf.String()
+	start := strings.Index(output, marker)
+	if start < 0 {
+		return
+	}
+
+	rest := output[start+len(marker):]
+	end := strings.Index(rest, "\n")
+	if end < 0 {
+		return
+	}
+
+	w.callbackRequested = true
+	parsed, err := url.Parse(rest[:end])
+	if err != nil {
+		w.t.Fatalf("parse auth URL: %v", err)
+	}
+	callbackURL := parsed.Query().Get("redirect_uri") + "?code=code-test&state=state-test"
+	resp, err := http.Get(callbackURL)
+	if err != nil {
+		w.t.Fatalf("callback request: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		w.t.Fatalf("unexpected callback status: %s", resp.Status)
 	}
 }
 

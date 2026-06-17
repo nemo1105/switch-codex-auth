@@ -48,11 +48,16 @@ type loginTokens struct {
 	RefreshToken string `json:"refresh_token"`
 }
 
+type loginOptions struct {
+	Force        bool
+	PrintURLOnly bool
+}
+
 type apiKeyExchangeResponse struct {
 	AccessToken string `json:"access_token"`
 }
 
-func loginAndSaveAlias(codexDir, selection string, force bool, in io.Reader, out io.Writer, interactive bool) error {
+func loginAndSaveAlias(codexDir, selection string, options loginOptions, in io.Reader, out io.Writer, interactive bool) error {
 	reader := (*bufio.Reader)(nil)
 	if interactive {
 		reader = bufio.NewReader(in)
@@ -64,7 +69,7 @@ func loginAndSaveAlias(codexDir, selection string, force bool, in io.Reader, out
 		if err != nil {
 			return err
 		}
-		if reader == nil && !force {
+		if reader == nil && !options.Force {
 			targetPath := filepath.Join(codexDir, "auth.json."+suffix)
 			if _, err := os.Stat(targetPath); err == nil {
 				return fmt.Errorf("auth alias already exists: %s (use --force to overwrite or choose a different alias)", filepath.Base(targetPath))
@@ -77,7 +82,7 @@ func loginAndSaveAlias(codexDir, selection string, force bool, in io.Reader, out
 		return errors.New("login requires <suffix> when stdin is non-interactive")
 	}
 
-	auth, err := runOAuthLogin(out)
+	auth, err := runOAuthLogin(out, options.PrintURLOnly)
 	if err != nil {
 		return err
 	}
@@ -97,7 +102,7 @@ func loginAndSaveAlias(codexDir, selection string, force bool, in io.Reader, out
 	}
 	defer os.Remove(tempPath)
 
-	finalSuffix, err := saveSourceAsAliasWithReader(codexDir, tempPath, suffix, force, reader, out, "Saved login auth as")
+	finalSuffix, err := saveSourceAsAliasWithReader(codexDir, tempPath, suffix, options.Force, reader, out, "Saved login auth as")
 	if err != nil {
 		return err
 	}
@@ -126,7 +131,7 @@ func promptForInitialLoginAlias(reader *bufio.Reader, out io.Writer) (string, er
 	}
 }
 
-func runOAuthLogin(out io.Writer) (authPayload, error) {
+func runOAuthLogin(out io.Writer, printURLOnly bool) (authPayload, error) {
 	pkce, err := generatePKCEFunc()
 	if err != nil {
 		return authPayload{}, err
@@ -157,8 +162,10 @@ func runOAuthLogin(out io.Writer) (authPayload, error) {
 	redirectURI := fmt.Sprintf("http://localhost:%d/auth/callback", port)
 	authURL := buildLoginAuthorizeURL(loginIssuer, redirectURI, pkce.Challenge, state)
 	fmt.Fprintf(out, "Open this URL to log in:\n\n%s\n\n", authURL)
-	if err := openBrowserFunc(authURL); err != nil {
-		fmt.Fprintf(out, "Warning: failed to open browser: %v\n", err)
+	if !printURLOnly {
+		if err := openBrowserFunc(authURL); err != nil {
+			fmt.Fprintf(out, "Warning: failed to open browser: %v\n", err)
+		}
 	}
 
 	result := <-resultCh

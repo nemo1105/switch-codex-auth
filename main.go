@@ -145,12 +145,12 @@ func runSaveSubcommand(args []string, in io.Reader, out io.Writer, prog string) 
 }
 
 func runLoginSubcommand(args []string, in io.Reader, out io.Writer, prog string) error {
-	selection, force, handled, err := parseLoginSubcommandArgs(args, out, prog)
+	selection, options, handled, err := parseLoginSubcommandArgs(args, out, prog)
 	if handled || err != nil {
 		return err
 	}
 
-	return runLoginCommand(selection, force, in, out)
+	return runLoginCommand(selection, options, in, out)
 }
 
 func runRefreshSubcommand(args []string, out io.Writer, prog string) error {
@@ -199,13 +199,13 @@ func runSaveCommand(selection string, force bool, in io.Reader, out io.Writer) e
 	return saveCurrentAsWithIO(codexDir, selection, force, in, out, isInteractiveReader(in))
 }
 
-func runLoginCommand(selection string, force bool, in io.Reader, out io.Writer) error {
+func runLoginCommand(selection string, options loginOptions, in io.Reader, out io.Writer) error {
 	codexDir, err := codexHome()
 	if err != nil {
 		return err
 	}
 
-	return loginAndSaveAlias(codexDir, selection, force, in, out, isInteractiveReader(in))
+	return loginAndSaveAlias(codexDir, selection, options, in, out, isInteractiveReader(in))
 }
 
 func runRefreshCommand(out io.Writer, options refreshOptions) error {
@@ -320,29 +320,31 @@ func parseSaveSubcommandArgs(args []string, out io.Writer, prog string) (string,
 	}
 }
 
-func parseLoginSubcommandArgs(args []string, out io.Writer, prog string) (string, bool, bool, error) {
+func parseLoginSubcommandArgs(args []string, out io.Writer, prog string) (string, loginOptions, bool, error) {
 	flagSet := flag.NewFlagSet("login", flag.ContinueOnError)
 	flagSet.SetOutput(io.Discard)
 
-	var force bool
-	flagSet.BoolVar(&force, "f", false, "overwrite an existing auth alias")
-	flagSet.BoolVar(&force, "force", false, "overwrite an existing auth alias")
+	var options loginOptions
+	flagSet.BoolVar(&options.Force, "f", false, "overwrite an existing auth alias")
+	flagSet.BoolVar(&options.Force, "force", false, "overwrite an existing auth alias")
+	flagSet.BoolVar(&options.PrintURLOnly, "p", false, "print the login URL without opening a browser")
+	flagSet.BoolVar(&options.PrintURLOnly, "print-url-only", false, "print the login URL without opening a browser")
 
-	if err := flagSet.Parse(normalizeSaveArgs(args)); err != nil {
+	if err := flagSet.Parse(normalizeLoginArgs(args)); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			writeLoginUsage(out, prog)
-			return "", false, true, nil
+			return "", loginOptions{}, true, nil
 		}
-		return "", false, false, fmt.Errorf("%v (run `%s help login` for usage)", err, prog)
+		return "", loginOptions{}, false, fmt.Errorf("%v (run `%s help login` for usage)", err, prog)
 	}
 
 	switch flagSet.NArg() {
 	case 0:
-		return "", force, false, nil
+		return "", options, false, nil
 	case 1:
-		return flagSet.Arg(0), force, false, nil
+		return flagSet.Arg(0), options, false, nil
 	default:
-		return "", false, false, fmt.Errorf("login accepts at most one <suffix> (usage: %s login [suffix] [-f|--force])", prog)
+		return "", loginOptions{}, false, fmt.Errorf("login accepts at most one <suffix> (usage: %s login [suffix] [-f|--force] [-p|--print-url-only])", prog)
 	}
 }
 
@@ -388,6 +390,33 @@ func normalizeSaveArgs(args []string) []string {
 	return append(flags, positionals...)
 }
 
+func normalizeLoginArgs(args []string) []string {
+	flags := make([]string, 0, len(args))
+	positionals := make([]string, 0, len(args))
+
+	for _, arg := range args {
+		if isLoginFlagArg(arg) {
+			flags = append(flags, arg)
+		} else {
+			positionals = append(positionals, arg)
+		}
+	}
+
+	return append(flags, positionals...)
+}
+
+func isLoginFlagArg(arg string) bool {
+	switch arg {
+	case "-f", "--force", "-p", "--print-url-only", "-h", "--help":
+		return true
+	default:
+		return strings.HasPrefix(arg, "-f=") ||
+			strings.HasPrefix(arg, "--force=") ||
+			strings.HasPrefix(arg, "-p=") ||
+			strings.HasPrefix(arg, "--print-url-only=")
+	}
+}
+
 func legacyActionFlagError(args []string, prog string) error {
 	if len(args) == 0 {
 		return nil
@@ -418,7 +447,7 @@ func writeRootUsage(w io.Writer, prog string) {
 	fmt.Fprintf(w, "  %s list [--usage none|api|chat]\n", prog)
 	fmt.Fprintf(w, "  %s use <suffix-or-index>\n", prog)
 	fmt.Fprintf(w, "  %s save <suffix> [-f|--force]\n", prog)
-	fmt.Fprintf(w, "  %s login [suffix] [-f|--force]\n", prog)
+	fmt.Fprintf(w, "  %s login [suffix] [-f|--force] [-p|--print-url-only]\n", prog)
 	fmt.Fprintf(w, "  %s refresh [-f|--force] [--days N]\n", prog)
 	fmt.Fprintf(w, "  %s help [command]\n", prog)
 	fmt.Fprintf(w, "\nCommands:\n")
@@ -452,7 +481,10 @@ func writeSaveUsage(w io.Writer, prog string) {
 
 func writeLoginUsage(w io.Writer, prog string) {
 	fmt.Fprintf(w, "Usage:\n")
-	fmt.Fprintf(w, "  %s login [suffix] [-f|--force]\n", prog)
+	fmt.Fprintf(w, "  %s login [suffix] [-f|--force] [-p|--print-url-only]\n", prog)
+	fmt.Fprintf(w, "\nOptions:\n")
+	fmt.Fprintf(w, "  -f, --force       Overwrite an existing auth alias\n")
+	fmt.Fprintf(w, "  -p, --print-url-only  Print the login URL without opening a browser (default false)\n")
 }
 
 func writeRefreshUsage(w io.Writer, prog string) {
