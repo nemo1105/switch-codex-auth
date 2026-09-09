@@ -567,6 +567,10 @@ func int64Ptr(value int64) *int64 {
 }
 
 func assertUsageProbeRequest(t *testing.T, r *http.Request, expectedAuth, expectedAccount string) {
+	assertUsageProbeRequestModel(t, r, expectedAuth, expectedAccount, "gpt-5.6-luna")
+}
+
+func assertUsageProbeRequestModel(t *testing.T, r *http.Request, expectedAuth, expectedAccount, expectedModel string) {
 	t.Helper()
 
 	if r.Method != http.MethodPost {
@@ -595,7 +599,7 @@ func assertUsageProbeRequest(t *testing.T, r *http.Request, expectedAuth, expect
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		t.Fatalf("decode usage probe request: %v", err)
 	}
-	if got := body["model"]; got != defaultUsageProbeModel {
+	if got := body["model"]; got != expectedModel {
 		t.Fatalf("unexpected usage probe model: %#v", got)
 	}
 	if got := body["stream"]; got != true {

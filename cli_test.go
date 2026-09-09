@@ -322,7 +322,7 @@ func TestRunCLIListCommandDoesNotRequestUsageByDefault(t *testing.T) {
 	}
 }
 
-func TestRunCLIListCommandDisplaysChatUsage(t *testing.T) {
+func TestRunCLIListCommandDisplaysChatUsageWithCustomModel(t *testing.T) {
 	fixedNow := time.Date(2026, 4, 4, 12, 0, 0, 0, time.UTC)
 	oldNow := nowFunc
 	nowFunc = func() time.Time { return fixedNow }
@@ -348,7 +348,7 @@ func TestRunCLIListCommandDisplaysChatUsage(t *testing.T) {
 	})
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		assertUsageProbeRequest(t, r, "Bearer demo-token", "acct-demo")
+		assertUsageProbeRequestModel(t, r, "Bearer demo-token", "acct-demo", "gpt-custom")
 		writeUsageProbeResponse(t, w, map[string]string{
 			"x-codex-primary-used-percent":   "42",
 			"x-codex-primary-window-minutes": "5",
@@ -362,7 +362,7 @@ func TestRunCLIListCommandDisplaysChatUsage(t *testing.T) {
 	setUsageBaseURLForTest(t, server.URL+"/backend-api")
 
 	var out bytes.Buffer
-	if err := runCLI([]string{"list", "--usage", "chat"}, strings.NewReader(""), &out); err != nil {
+	if err := runCLI([]string{"list", "--usage", "chat", "--model", "gpt-custom"}, strings.NewReader(""), &out); err != nil {
 		t.Fatalf("runCLI: %v", err)
 	}
 
@@ -687,6 +687,22 @@ func TestRunCLIRejectsInvalidUsageMode(t *testing.T) {
 			t.Fatalf("expected invalid usage mode error for %v", args)
 		}
 		if !strings.Contains(err.Error(), "usage must be one of: none, api, chat") {
+			t.Fatalf("unexpected error for %v: %v", args, err)
+		}
+	}
+}
+
+func TestRunCLIRejectsEmptyUsageModel(t *testing.T) {
+	for _, args := range [][]string{
+		{"--model", ""},
+		{"list", "--model", "  "},
+	} {
+		var out bytes.Buffer
+		err := runCLI(args, strings.NewReader(""), &out)
+		if err == nil {
+			t.Fatalf("expected empty model error for %v", args)
+		}
+		if !strings.Contains(err.Error(), "model must not be empty") {
 			t.Fatalf("unexpected error for %v: %v", args, err)
 		}
 	}
