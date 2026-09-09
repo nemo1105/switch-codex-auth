@@ -23,6 +23,7 @@ Show the current auth profile and available backups:
 ```bash
 switch-codex-auth list
 switch-codex-auth list --usage chat
+switch-codex-auth list --usage chat --model gpt-5.6-luna
 switch-codex-auth list --usage api
 ```
 
@@ -30,13 +31,15 @@ The list shows how many `auth.json.*` backups are available, along with relative
 such as `3h ago` or `3d ago` for each file's `last_refresh` timestamp from the auth
 payload. Usage is not fetched by default and displays as `-`. Use `--usage chat` to
 fetch usage by sending a minimal Codex request and reading quota headers, or `--usage api`
-to use the direct usage endpoint.
+to use the direct usage endpoint. Chat probes use `gpt-5.6-luna` by default; pass
+`--model <name>` to use a different model for the probe.
 
 Open the interactive selector:
 
 ```bash
 switch-codex-auth
 switch-codex-auth --usage chat
+switch-codex-auth --usage chat --model gpt-5.6-luna
 ```
 
 The interactive view shows the same table before prompting for a selection. When usage is
@@ -110,7 +113,7 @@ You can override the directory with `CODEX_HOME`.
 
 - Scans `auth.json.*` files and lists them by suffix.
 - Shows the number of available auth files, marks the current alias with `*` in the index column, and displays relative `last_refresh` time when present.
-- Leaves usage blank by default. `--usage chat` fetches usage for ChatGPT-backed aliases via a minimal Codex request, and `--usage api` uses the direct usage endpoint; rows show a compact remaining-quota summary, `n/a`, or a concise status/message error when usage is unavailable.
+- Leaves usage blank by default. `--usage chat` fetches usage for ChatGPT-backed aliases via a minimal Codex request using `gpt-5.6-luna` by default; `--model <name>` overrides that probe model, while `--usage api` uses the direct usage endpoint. Rows show a compact remaining-quota summary, `n/a`, or a concise status/message error when usage is unavailable.
 - Detects which backup currently matches `auth.json`.
 - Replaces `auth.json` through a temp file in the same directory before renaming it into place.
 - Supports `list`, `use`, `save`, `login`, and `refresh` as explicit subcommands.

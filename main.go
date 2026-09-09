@@ -41,7 +41,19 @@ type authMetadata struct {
 }
 
 var nowFunc = time.Now
-var enrichCandidatesWithUsageFunc = enrichCandidatesWithUsage
+var enrichCandidatesWithUsageFunc = enrichCandidatesWithUsageModel
+
+type usageOptions struct {
+	Mode  usageMode
+	Model string
+}
+
+func defaultUsageOptions() usageOptions {
+	return usageOptions{
+		Mode:  usageModeNone,
+		Model: defaultUsageProbeModel,
+	}
+}
 
 func main() {
 	if err := runCLI(os.Args[1:], os.Stdin, os.Stdout); err != nil {
@@ -52,7 +64,7 @@ func main() {
 func runCLI(args []string, in io.Reader, out io.Writer) error {
 	prog := filepath.Base(os.Args[0])
 	if len(args) == 0 {
-		return runInteractiveCommand(in, out, usageModeNone)
+		return runInteractiveCommand(in, out, defaultUsageOptions())
 	}
 
 	switch args[0] {
@@ -76,11 +88,11 @@ func runCLI(args []string, in io.Reader, out io.Writer) error {
 			return err
 		}
 		if strings.HasPrefix(args[0], "-") {
-			usageMode, handled, err := parseRootInteractiveArgs(args, out, prog)
+			options, handled, err := parseRootInteractiveArgs(args, out, prog)
 			if handled || err != nil {
 				return err
 			}
-			return runInteractiveCommand(in, out, usageMode)
+			return runInteractiveCommand(in, out, options)
 		}
 
 		return fmt.Errorf("unknown command: %s (run `%s help` for usage)", args[0], prog)
@@ -118,12 +130,12 @@ func runHelpCommand(args []string, out io.Writer, prog string) error {
 }
 
 func runListSubcommand(args []string, out io.Writer, prog string) error {
-	usageMode, handled, err := parseListSubcommandArgs(args, out, prog)
+	options, handled, err := parseListSubcommandArgs(args, out, prog)
 	if handled || err != nil {
 		return err
 	}
 
-	return runListCommand(out, usageMode)
+	return runListCommand(out, options)
 }
 
 func runUseSubcommand(args []string, out io.Writer, prog string) error {
@@ -162,8 +174,8 @@ func runRefreshSubcommand(args []string, out io.Writer, prog string) error {
 	return runRefreshCommand(out, options)
 }
 
-func runInteractiveCommand(in io.Reader, out io.Writer, usageMode usageMode) error {
-	codexDir, candidates, current, currentMetadata, err := loadInteractiveState(usageMode)
+func runInteractiveCommand(in io.Reader, out io.Writer, options usageOptions) error {
+	codexDir, candidates, current, currentMetadata, err := loadInteractiveState(options)
 	if err != nil {
 		return err
 	}
@@ -171,8 +183,8 @@ func runInteractiveCommand(in io.Reader, out io.Writer, usageMode usageMode) err
 	return interactiveModeWithIO(codexDir, current, currentMetadata, candidates, in, out)
 }
 
-func runListCommand(out io.Writer, usageMode usageMode) error {
-	codexDir, candidates, current, currentMetadata, err := loadInteractiveState(usageMode)
+func runListCommand(out io.Writer, options usageOptions) error {
+	codexDir, candidates, current, currentMetadata, err := loadInteractiveState(options)
 	if err != nil {
 		return err
 	}
@@ -222,54 +234,68 @@ func runRefreshCommand(out io.Writer, options refreshOptions) error {
 	return refreshAuthAliases(out, codexDir, candidates, options)
 }
 
-func parseRootInteractiveArgs(args []string, out io.Writer, prog string) (usageMode, bool, error) {
+func parseRootInteractiveArgs(args []string, out io.Writer, prog string) (usageOptions, bool, error) {
 	flagSet := flag.NewFlagSet(prog, flag.ContinueOnError)
 	flagSet.SetOutput(io.Discard)
 
-	usageValue := string(usageModeNone)
+	options := defaultUsageOptions()
+	usageValue := string(options.Mode)
 	flagSet.StringVar(&usageValue, "usage", string(usageModeNone), "usage fetch mode: none, api, or chat")
+	flagSet.StringVar(&options.Model, "model", defaultUsageProbeModel, "model for chat usage probes")
 
 	if err := flagSet.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			writeRootUsage(out, prog)
-			return usageModeNone, true, nil
+			return usageOptions{}, true, nil
 		}
-		return usageModeNone, false, fmt.Errorf("%v (run `%s help` for usage)", err, prog)
+		return usageOptions{}, false, fmt.Errorf("%v (run `%s help` for usage)", err, prog)
 	}
 	if flagSet.NArg() != 0 {
-		return usageModeNone, false, fmt.Errorf("interactive mode does not accept arguments (usage: %s [--usage none|api|chat])", prog)
+		return usageOptions{}, false, fmt.Errorf("interactive mode does not accept arguments (usage: %s [--usage none|api|chat] [--model name])", prog)
 	}
 
 	mode, err := parseUsageMode(usageValue)
 	if err != nil {
-		return usageModeNone, false, fmt.Errorf("%v (run `%s help` for usage)", err, prog)
+		return usageOptions{}, false, fmt.Errorf("%v (run `%s help` for usage)", err, prog)
 	}
-	return mode, false, nil
+	options.Mode = mode
+	options.Model = strings.TrimSpace(options.Model)
+	if options.Model == "" {
+		return usageOptions{}, false, fmt.Errorf("model must not be empty (run `%s help` for usage)", prog)
+	}
+	return options, false, nil
 }
 
-func parseListSubcommandArgs(args []string, out io.Writer, prog string) (usageMode, bool, error) {
+func parseListSubcommandArgs(args []string, out io.Writer, prog string) (usageOptions, bool, error) {
 	flagSet := flag.NewFlagSet("list", flag.ContinueOnError)
 	flagSet.SetOutput(io.Discard)
 
-	usageValue := string(usageModeNone)
+	options := defaultUsageOptions()
+	usageValue := string(options.Mode)
 	flagSet.StringVar(&usageValue, "usage", string(usageModeNone), "usage fetch mode: none, api, or chat")
+	flagSet.StringVar(&options.Model, "model", defaultUsageProbeModel, "model for chat usage probes")
 
 	if err := flagSet.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			writeListUsage(out, prog)
-			return usageModeNone, true, nil
+			return usageOptions{}, true, nil
 		}
-		return usageModeNone, false, fmt.Errorf("%v (run `%s help list` for usage)", err, prog)
+		return usageOptions{}, false, fmt.Errorf("%v (run `%s help list` for usage)", err, prog)
 	}
 	if flagSet.NArg() != 0 {
-		return usageModeNone, false, fmt.Errorf("list does not accept arguments (usage: %s list [--usage none|api|chat])", prog)
+		return usageOptions{}, false, fmt.Errorf("list does not accept arguments (usage: %s list [--usage none|api|chat] [--model name])", prog)
 	}
 
 	mode, err := parseUsageMode(usageValue)
 	if err != nil {
-		return usageModeNone, false, fmt.Errorf("%v (run `%s help list` for usage)", err, prog)
+		return usageOptions{}, false, fmt.Errorf("%v (run `%s help list` for usage)", err, prog)
 	}
-	return mode, false, nil
+	options.Mode = mode
+	options.Model = strings.TrimSpace(options.Model)
+	if options.Model == "" {
+		return usageOptions{}, false, fmt.Errorf("model must not be empty (run `%s help list` for usage)", prog)
+	}
+	return options, false, nil
 }
 
 func parseUseSubcommandArgs(args []string, out io.Writer, prog string) (string, bool, error) {
@@ -443,8 +469,8 @@ func legacyActionFlagError(args []string, prog string) error {
 
 func writeRootUsage(w io.Writer, prog string) {
 	fmt.Fprintf(w, "Usage:\n")
-	fmt.Fprintf(w, "  %s [--usage none|api|chat]\n", prog)
-	fmt.Fprintf(w, "  %s list [--usage none|api|chat]\n", prog)
+	fmt.Fprintf(w, "  %s [--usage none|api|chat] [--model name]\n", prog)
+	fmt.Fprintf(w, "  %s list [--usage none|api|chat] [--model name]\n", prog)
 	fmt.Fprintf(w, "  %s use <suffix-or-index>\n", prog)
 	fmt.Fprintf(w, "  %s save <suffix> [-f|--force]\n", prog)
 	fmt.Fprintf(w, "  %s login [suffix] [-f|--force] [-p|--print-url-only]\n", prog)
@@ -458,15 +484,17 @@ func writeRootUsage(w io.Writer, prog string) {
 	fmt.Fprintf(w, "  refresh  Refresh auth.json.* files whose last_refresh is at least N days old unless forced (default 7)\n")
 	fmt.Fprintf(w, "\nOptions:\n")
 	fmt.Fprintf(w, "  --usage  Usage fetch mode for list and interactive mode: none, api, or chat (default none)\n")
+	fmt.Fprintf(w, "  --model  Model for chat usage probes (default %s)\n", defaultUsageProbeModel)
 	fmt.Fprintf(w, "\nEnvironment:\n")
 	fmt.Fprintf(w, "  CODEX_HOME  Override the auth directory. Defaults to %s\n", defaultCodexHomeHint())
 }
 
 func writeListUsage(w io.Writer, prog string) {
 	fmt.Fprintf(w, "Usage:\n")
-	fmt.Fprintf(w, "  %s list [--usage none|api|chat]\n", prog)
+	fmt.Fprintf(w, "  %s list [--usage none|api|chat] [--model name]\n", prog)
 	fmt.Fprintf(w, "\nOptions:\n")
 	fmt.Fprintf(w, "  --usage  Usage fetch mode: none, api, or chat (default none)\n")
+	fmt.Fprintf(w, "  --model  Model for chat usage probes (default %s)\n", defaultUsageProbeModel)
 }
 
 func writeUseUsage(w io.Writer, prog string) {
@@ -492,7 +520,7 @@ func writeRefreshUsage(w io.Writer, prog string) {
 	fmt.Fprintf(w, "  %s refresh [-f|--force] [--days N]\n", prog)
 }
 
-func loadInteractiveState(usageMode usageMode) (string, []candidate, string, *authMetadata, error) {
+func loadInteractiveState(options usageOptions) (string, []candidate, string, *authMetadata, error) {
 	codexDir, err := codexHome()
 	if err != nil {
 		return "", nil, "", nil, err
@@ -513,8 +541,8 @@ func loadInteractiveState(usageMode usageMode) (string, []candidate, string, *au
 		return "", nil, "", nil, err
 	}
 
-	if usageMode != usageModeNone {
-		candidates = enrichCandidatesWithUsageFunc(candidates, usageMode)
+	if options.Mode != usageModeNone {
+		candidates = enrichCandidatesWithUsageFunc(candidates, options.Mode, options.Model)
 	}
 
 	return codexDir, candidates, current, currentMetadata, nil

@@ -22,7 +22,7 @@ import (
 const (
 	defaultUsageBaseURL        = "https://chatgpt.com/backend-api"
 	defaultUsageRequestTimeout = 5 * time.Second
-	defaultUsageProbeModel     = "gpt-5.4"
+	defaultUsageProbeModel     = "gpt-5.6-luna"
 	usageRequestStagger        = 50 * time.Millisecond
 	usagePercentWidth          = 4
 	usageDurationWidth         = 6
@@ -139,6 +139,10 @@ func parseUsageMode(value string) (usageMode, error) {
 }
 
 func enrichCandidatesWithUsage(candidates []candidate, mode usageMode) []candidate {
+	return enrichCandidatesWithUsageModel(candidates, mode, defaultUsageProbeModel)
+}
+
+func enrichCandidatesWithUsageModel(candidates []candidate, mode usageMode, model string) []candidate {
 	enriched := append([]candidate(nil), candidates...)
 	if len(enriched) == 0 || mode == usageModeNone {
 		return enriched
@@ -232,7 +236,7 @@ func enrichCandidatesWithUsage(candidates []candidate, mode usageMode) []candida
 				<-timer.C
 			}
 
-			snapshots, err := requestAccountUsage(client, requestGroups[key].auth, mode)
+			snapshots, err := requestAccountUsage(client, requestGroups[key].auth, mode, model)
 			summary := formatUsageError(err)
 			var remainingMetric usageRemainingMetrics
 			if err == nil {
@@ -260,12 +264,12 @@ func enrichCandidatesWithUsage(candidates []candidate, mode usageMode) []candida
 	return enriched
 }
 
-func requestAccountUsage(client *http.Client, auth usageAuth, mode usageMode) ([]accountRateLimitSnapshot, error) {
+func requestAccountUsage(client *http.Client, auth usageAuth, mode usageMode, model string) ([]accountRateLimitSnapshot, error) {
 	switch mode {
 	case usageModeAPI:
 		return requestAccountUsageViaAPI(client, auth)
 	case usageModeChat:
-		return requestAccountUsageViaChat(client, auth)
+		return requestAccountUsageViaChatModel(client, auth, model)
 	case usageModeNone:
 		return nil, fmt.Errorf("usage mode is none")
 	default:
@@ -309,12 +313,16 @@ func requestAccountUsageViaAPI(client *http.Client, auth usageAuth) ([]accountRa
 }
 
 func requestAccountUsageViaChat(client *http.Client, auth usageAuth) ([]accountRateLimitSnapshot, error) {
+	return requestAccountUsageViaChatModel(client, auth, defaultUsageProbeModel)
+}
+
+func requestAccountUsageViaChatModel(client *http.Client, auth usageAuth, model string) ([]accountRateLimitSnapshot, error) {
 	url := usageProbeEndpointURL(normalizeUsageBaseURL(usageBaseURL))
 	if url == "" {
 		return nil, fmt.Errorf("usage base URL is empty")
 	}
 
-	requestBody, err := json.Marshal(buildUsageProbeRequest())
+	requestBody, err := json.Marshal(buildUsageProbeRequest(model))
 	if err != nil {
 		return nil, fmt.Errorf("encode usage probe request: %w", err)
 	}
@@ -353,9 +361,9 @@ func requestAccountUsageViaChat(client *http.Client, auth usageAuth) ([]accountR
 	return snapshots, nil
 }
 
-func buildUsageProbeRequest() map[string]any {
+func buildUsageProbeRequest(model string) map[string]any {
 	return map[string]any{
-		"model": defaultUsageProbeModel,
+		"model": model,
 		"instructions": strings.Join([]string{
 			"Return exactly OK.",
 			"Do not include any other text.",
