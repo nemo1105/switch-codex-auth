@@ -60,6 +60,44 @@ switch-codex-auth use 11
 switch-codex-auth use auth.json.wcl
 ```
 
+### Switching with the Codex background server
+
+Recent Codex CLI versions can reuse a shared local background server. Replacing
+`auth.json` does not necessarily reload that server's in-memory credentials:
+`switch-codex-auth` may select account B while a new terminal running `codex`
+still shows account A in `/status`.
+
+After a successful selection, this tool checks `codex app-server daemon version`
+using the same `CODEX_HOME`. If a server is running, the default behavior prints
+recovery instructions without interrupting other tasks. To apply the switch to
+the shared server too, explicitly opt into a restart:
+
+```bash
+switch-codex-auth use tech --restart-daemon
+switch-codex-auth --restart-daemon
+switch-codex-auth --usage chat --restart-daemon
+```
+
+**Restarting the shared server interrupts its running tasks and disconnects its
+clients.** Wait for other tasks to finish before using this option. Interactive
+mode restarts only after background alias refresh has finished and the selected
+credentials have been synced to `auth.json`. The option also works when the
+selected alias already matches `auth.json`, so a previously stale server can be
+restarted without selecting another alias first.
+
+Alternatively, use `codex --no-daemon` after switching to start an independent
+process with the selected file credentials, or manually run
+`codex app-server daemon restart` when ready. Open Codex and run `/status` to
+verify the account afterward.
+
+The check does not start a daemon. Default switching still works when Codex is
+not installed or the status command is unavailable. With `--restart-daemon`, a
+failed status check, restart, or verification returns an error that explicitly
+states that `auth.json` remains selected; the file is not rolled back. Only a
+server reported as running is restarted. These commands were verified with
+Codex CLI 0.162.1. The tool manages file credentials; accounts held by the desktop
+app or an OS credential store may need separate handling.
+
 Save the current `auth.json` as a new alias:
 
 ```bash
@@ -116,6 +154,7 @@ You can override the directory with `CODEX_HOME`.
 - Leaves usage blank by default. `--usage chat` fetches usage for ChatGPT-backed aliases via a minimal Codex request using `gpt-5.6-luna` by default; `--model <name>` overrides that probe model, while `--usage api` uses the direct usage endpoint. Rows show a compact remaining-quota summary, `n/a`, or a concise status/message error when usage is unavailable.
 - Detects which backup currently matches `auth.json`.
 - Replaces `auth.json` through a temp file in the same directory before renaming it into place.
+- Checks for a shared Codex background server after selection and prints guidance when it may retain the previous account. `--restart-daemon` explicitly restarts a running server after the final auth-file sync.
 - Supports `list`, `use`, `save`, `login`, and `refresh` as explicit subcommands.
 - Saves a new alias with `save <suffix>`, prompting before overwriting an existing `auth.json.<suffix>` in interactive terminals.
 - Saves a new OAuth login with `login [suffix]`, prompting for the suffix after sign-in when omitted.

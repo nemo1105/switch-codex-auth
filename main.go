@@ -44,8 +44,9 @@ var nowFunc = time.Now
 var enrichCandidatesWithUsageFunc = enrichCandidatesWithUsageModel
 
 type usageOptions struct {
-	Mode  usageMode
-	Model string
+	Mode          usageMode
+	Model         string
+	RestartDaemon bool
 }
 
 func defaultUsageOptions() usageOptions {
@@ -139,12 +140,12 @@ func runListSubcommand(args []string, out io.Writer, prog string) error {
 }
 
 func runUseSubcommand(args []string, out io.Writer, prog string) error {
-	selection, handled, err := parseUseSubcommandArgs(args, out, prog)
+	selection, restartDaemon, handled, err := parseUseSubcommandArgs(args, out, prog)
 	if handled || err != nil {
 		return err
 	}
 
-	return runUseCommand(selection, out)
+	return runUseCommand(selection, restartDaemon, out)
 }
 
 func runSaveSubcommand(args []string, in io.Reader, out io.Writer, prog string) error {
@@ -180,7 +181,7 @@ func runInteractiveCommand(in io.Reader, out io.Writer, options usageOptions) er
 		return err
 	}
 
-	return interactiveModeWithIO(codexDir, current, currentMetadata, candidates, in, out)
+	return interactiveModeWithOptions(codexDir, current, currentMetadata, candidates, in, out, options.RestartDaemon)
 }
 
 func runListCommand(out io.Writer, options usageOptions) error {
@@ -193,13 +194,16 @@ func runListCommand(out io.Writer, options usageOptions) error {
 	return nil
 }
 
-func runUseCommand(selection string, out io.Writer) error {
+func runUseCommand(selection string, restartDaemon bool, out io.Writer) error {
 	codexDir, candidates, current, err := loadSwitchState()
 	if err != nil {
 		return err
 	}
 
-	return switchToWithIO(codexDir, current, candidates, out, selection)
+	if err := switchToWithIO(codexDir, current, candidates, out, selection); err != nil {
+		return err
+	}
+	return handleCodexDaemon(codexDir, restartDaemon, out)
 }
 
 func runSaveCommand(selection string, force bool, in io.Reader, out io.Writer) error {
@@ -242,6 +246,7 @@ func parseRootInteractiveArgs(args []string, out io.Writer, prog string) (usageO
 	usageValue := string(options.Mode)
 	flagSet.StringVar(&usageValue, "usage", string(usageModeNone), "usage fetch mode: none, api, or chat")
 	flagSet.StringVar(&options.Model, "model", defaultUsageProbeModel, "model for chat usage probes")
+	flagSet.BoolVar(&options.RestartDaemon, "restart-daemon", false, "restart a running Codex daemon after selection (interrupts running tasks)")
 
 	if err := flagSet.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -251,7 +256,7 @@ func parseRootInteractiveArgs(args []string, out io.Writer, prog string) (usageO
 		return usageOptions{}, false, fmt.Errorf("%v (run `%s help` for usage)", err, prog)
 	}
 	if flagSet.NArg() != 0 {
-		return usageOptions{}, false, fmt.Errorf("interactive mode does not accept arguments (usage: %s [--usage none|api|chat] [--model name])", prog)
+		return usageOptions{}, false, fmt.Errorf("interactive mode does not accept arguments (usage: %s [--usage none|api|chat] [--model name] [--restart-daemon])", prog)
 	}
 
 	mode, err := parseUsageMode(usageValue)
@@ -298,25 +303,41 @@ func parseListSubcommandArgs(args []string, out io.Writer, prog string) (usageOp
 	return options, false, nil
 }
 
-func parseUseSubcommandArgs(args []string, out io.Writer, prog string) (string, bool, error) {
+func parseUseSubcommandArgs(args []string, out io.Writer, prog string) (string, bool, bool, error) {
 	flagSet := flag.NewFlagSet("use", flag.ContinueOnError)
 	flagSet.SetOutput(io.Discard)
+	var restartDaemon bool
+	flagSet.BoolVar(&restartDaemon, "restart-daemon", false, "restart a running Codex daemon after switching (interrupts running tasks)")
+	// Accept the switch option before or after the suffix, like save's --force.
+	var flags, positional []string
+	for i, arg := range args {
+		if arg == "--" {
+			positional = append(positional, args[i:]...)
+			break
+		}
+		if arg == "--restart-daemon" || strings.HasPrefix(arg, "--restart-daemon=") {
+			flags = append(flags, arg)
+		} else {
+			positional = append(positional, arg)
+		}
+	}
+	args = append(flags, positional...)
 
 	if err := flagSet.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			writeUseUsage(out, prog)
-			return "", true, nil
+			return "", false, true, nil
 		}
-		return "", false, fmt.Errorf("%v (run `%s help use` for usage)", err, prog)
+		return "", false, false, fmt.Errorf("%v (run `%s help use` for usage)", err, prog)
 	}
 
 	switch flagSet.NArg() {
 	case 1:
-		return flagSet.Arg(0), false, nil
+		return flagSet.Arg(0), restartDaemon, false, nil
 	case 0:
-		return "", false, fmt.Errorf("use requires <suffix-or-index> (usage: %s use <suffix-or-index>)", prog)
+		return "", false, false, fmt.Errorf("use requires <suffix-or-index> (usage: %s use <suffix-or-index> [--restart-daemon])", prog)
 	default:
-		return "", false, fmt.Errorf("use accepts exactly one <suffix-or-index> (usage: %s use <suffix-or-index>)", prog)
+		return "", false, false, fmt.Errorf("use accepts exactly one <suffix-or-index> (usage: %s use <suffix-or-index> [--restart-daemon])", prog)
 	}
 }
 
@@ -469,9 +490,9 @@ func legacyActionFlagError(args []string, prog string) error {
 
 func writeRootUsage(w io.Writer, prog string) {
 	fmt.Fprintf(w, "Usage:\n")
-	fmt.Fprintf(w, "  %s [--usage none|api|chat] [--model name]\n", prog)
+	fmt.Fprintf(w, "  %s [--usage none|api|chat] [--model name] [--restart-daemon]\n", prog)
 	fmt.Fprintf(w, "  %s list [--usage none|api|chat] [--model name]\n", prog)
-	fmt.Fprintf(w, "  %s use <suffix-or-index>\n", prog)
+	fmt.Fprintf(w, "  %s use <suffix-or-index> [--restart-daemon]\n", prog)
 	fmt.Fprintf(w, "  %s save <suffix> [-f|--force]\n", prog)
 	fmt.Fprintf(w, "  %s login [suffix] [-f|--force] [-p|--print-url-only]\n", prog)
 	fmt.Fprintf(w, "  %s refresh [-f|--force] [--days N]\n", prog)
@@ -485,6 +506,7 @@ func writeRootUsage(w io.Writer, prog string) {
 	fmt.Fprintf(w, "\nOptions:\n")
 	fmt.Fprintf(w, "  --usage  Usage fetch mode for list and interactive mode: none, api, or chat (default none)\n")
 	fmt.Fprintf(w, "  --model  Model for chat usage probes (default %s)\n", defaultUsageProbeModel)
+	fmt.Fprintln(w, "  --restart-daemon  Restart a running Codex daemon after switching; interrupts running tasks")
 	fmt.Fprintf(w, "\nEnvironment:\n")
 	fmt.Fprintf(w, "  CODEX_HOME  Override the auth directory. Defaults to %s\n", defaultCodexHomeHint())
 }
@@ -499,7 +521,8 @@ func writeListUsage(w io.Writer, prog string) {
 
 func writeUseUsage(w io.Writer, prog string) {
 	fmt.Fprintf(w, "Usage:\n")
-	fmt.Fprintf(w, "  %s use <suffix-or-index>\n", prog)
+	fmt.Fprintf(w, "  %s use <suffix-or-index> [--restart-daemon]\n", prog)
+	fmt.Fprintln(w, "\nOptions:\n  --restart-daemon  Restart a running Codex daemon after switching; interrupts running tasks")
 }
 
 func writeSaveUsage(w io.Writer, prog string) {
@@ -877,6 +900,10 @@ func interactiveModeWithIO(
 	in io.Reader,
 	out io.Writer,
 ) error {
+	return interactiveModeWithOptions(codexDir, current, currentMetadata, candidates, in, out, false)
+}
+
+func interactiveModeWithOptions(codexDir, current string, currentMetadata *authMetadata, candidates []candidate, in io.Reader, out io.Writer, restartDaemon bool) error {
 	printStatus(out, codexDir, current, currentMetadata, candidates)
 
 	if len(candidates) == 0 {
@@ -929,7 +956,11 @@ func interactiveModeWithIO(
 		if switchErr != nil {
 			return switchErr
 		}
-		return refreshErr
+		if refreshErr != nil {
+			return refreshErr
+		}
+		// Restart only after the selected alias's refreshed credentials are synced.
+		return handleCodexDaemon(codexDir, restartDaemon, out)
 	}
 }
 
